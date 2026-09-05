@@ -1,0 +1,105 @@
+name: quark-upload-reliability-v3640-nas-test
+
+on:
+  push:
+    branches:
+      - 'test/quark-upload-reliability-v3.64.0'
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup web
+        run: bash build.sh dev web
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          files="$(gofmt -l drivers/quark_uc/driver.go drivers/quark_uc/upload_reliability.go drivers/quark_uc/upload_reliability_test.go)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Run Quark regression tests
+        run: go test ./drivers/quark_uc
+
+      - name: Run Quark regression tests with race detector
+        run: go test -race ./drivers/quark_uc
+
+      - name: Run adjacent filesystem tests
+        run: go test ./internal/op ./server/webdav
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build DS923+ linux-amd64 test binary
+        run: |
+          set -euo pipefail
+          mkdir -p nas-test
+          BUILT_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          GO_VERSION="$(go version | awk '{print $3}')"
+          GIT_COMMIT="${GITHUB_SHA::7}"
+          VERSION="v3.64.0-quark-upload-reliability-test"
+          LDFLAGS="-w -s -linkmode external -extldflags=-static -X github.com/alist-org/alist/v3/internal/conf.BuiltAt=${BUILT_AT} -X github.com/alist-org/alist/v3/internal/conf.GoVersion=${GO_VERSION} -X github.com/alist-org/alist/v3/internal/conf.GitAuthor=NovumOrbis -X github.com/alist-org/alist/v3/internal/conf.GitCommit=${GIT_COMMIT} -X github.com/alist-org/alist/v3/internal/conf.Version=${VERSION} -X github.com/alist-org/alist/v3/internal/conf.WebVersion=dev"
+          CC=musl-gcc CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags=jsoniter -ldflags "$LDFLAGS" -o nas-test/alist .
+          chmod +x nas-test/alist
+          ./nas-test/alist version
+          file nas-test/alist
+          (cd nas-test && sha256sum alist > SHA256SUMS && sha256sum -c SHA256SUMS)
+
+      - name: Smoke test SQLite-backed startup
+        run: |
+          set -euo pipefail
+          mkdir -p nas-test/smoke-data
+          ./nas-test/alist server --no-prefix --data "$PWD/nas-test/smoke-data" --log-std > nas-test/smoke.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
+          ok=0
+          for i in $(seq 1 20); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat nas-test/smoke.log
+              exit 1
+            fi
+            if curl -fsS http://127.0.0.1:5244/ >/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$ok" -ne 1 ]; then
+            cat nas-test/smoke.log
+            exit 1
+          fi
+          test -s nas-test/smoke-data/data.db
+          kill "$PID"
+          wait "$PID" || true
+          trap - EXIT
+          if grep -F "go-sqlite3 requires cgo" nas-test/smoke.log; then
+            cat nas-test/smoke.log
+            exit 1
+          fi
+          rm -rf nas-test/smoke-data nas-test/smoke.log
+          tar -C nas-test -czf alist-v3.64.0-quark-upload-reliability-test-linux-amd64.tar.gz alist SHA256SUMS
+          sha256sum alist-v3.64.0-quark-upload-reliability-test-linux-amd64.tar.gz
+
+      - name: Upload NAS test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alist-v3.64.0-quark-upload-reliability-test-linux-amd64
+          path: alist-v3.64.0-quark-upload-reliability-test-linux-amd64.tar.gz
+          if-no-files-found: error
