@@ -35,12 +35,19 @@ jobs:
 
       - name: Build DS923+ linux-amd64 test binary
         run: |
+          set -euo pipefail
           mkdir -p nas-test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags=jsoniter -o nas-test/alist .
+          BUILT_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          GO_VERSION="$(go version | awk '{print $3}')"
+          GIT_COMMIT="${GITHUB_SHA::7}"
+          VERSION="v3.64.0-quark-mkdir-test"
+          LDFLAGS="-w -s -X github.com/alist-org/alist/v3/internal/conf.BuiltAt=${BUILT_AT} -X github.com/alist-org/alist/v3/internal/conf.GoVersion=${GO_VERSION} -X github.com/alist-org/alist/v3/internal/conf.GitAuthor=NovumOrbis -X github.com/alist-org/alist/v3/internal/conf.GitCommit=${GIT_COMMIT} -X github.com/alist-org/alist/v3/internal/conf.Version=${VERSION} -X github.com/alist-org/alist/v3/internal/conf.WebVersion=dev"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags=jsoniter -ldflags "$LDFLAGS" -o nas-test/alist .
           chmod +x nas-test/alist
-          ./nas-test/alist version || true
-          sha256sum nas-test/alist | tee nas-test/SHA256SUMS
+          ./nas-test/alist version
+          (cd nas-test && sha256sum alist > SHA256SUMS && sha256sum -c SHA256SUMS)
           tar -C nas-test -czf alist-v3.64.0-quark-mkdir-test-linux-amd64.tar.gz alist SHA256SUMS
+          sha256sum alist-v3.64.0-quark-mkdir-test-linux-amd64.tar.gz
 
       - name: Upload NAS test artifact
         uses: actions/upload-artifact@v4
