@@ -1,0 +1,45 @@
+name: quark-v3371-nas-test
+
+on:
+  push:
+    branches:
+      - 'test/quark-mkdir-v3.37.1'
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup web
+        run: bash build.sh dev web
+
+      - name: Compile Quark driver package
+        run: go test ./drivers/quark_uc
+
+      - name: Build linux amd64 NAS binary
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p nas-test
+          go build -tags=jsoniter -ldflags="-w -s -X 'github.com/alist-org/alist/v3/internal/conf.Version=v3.37.1-quark-mkdir-test'" -o nas-test/alist .
+          sha256sum nas-test/alist > nas-test/SHA256SUMS
+
+      - name: Package NAS test artifact
+        run: tar -C nas-test -czf alist-v3.37.1-quark-mkdir-test-linux-amd64.tar.gz alist SHA256SUMS
+
+      - name: Upload NAS test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alist-v3.37.1-quark-mkdir-test-linux-amd64
+          path: alist-v3.37.1-quark-mkdir-test-linux-amd64.tar.gz
+          if-no-files-found: error
