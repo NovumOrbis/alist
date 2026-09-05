@@ -1,0 +1,50 @@
+name: quark-v3640-nas-test
+
+on:
+  push:
+    branches:
+      - 'test/quark-mkdir-v3.64.0'
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup web
+        run: bash build.sh dev web
+
+      - name: Run Quark mkdir regression tests
+        run: go test ./drivers/quark_uc
+
+      - name: Run Quark mkdir regression tests with race detector
+        run: go test -race ./drivers/quark_uc
+
+      - name: Run adjacent filesystem tests
+        run: go test ./internal/op ./server/webdav
+
+      - name: Build DS923+ linux-amd64 test binary
+        run: |
+          mkdir -p nas-test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags=jsoniter -o nas-test/alist .
+          chmod +x nas-test/alist
+          ./nas-test/alist version || true
+          sha256sum nas-test/alist | tee nas-test/SHA256SUMS
+          tar -C nas-test -czf alist-v3.64.0-quark-mkdir-test-linux-amd64.tar.gz alist SHA256SUMS
+
+      - name: Upload NAS test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alist-v3.64.0-quark-mkdir-test-linux-amd64
+          path: alist-v3.64.0-quark-mkdir-test-linux-amd64.tar.gz
+          if-no-files-found: error
