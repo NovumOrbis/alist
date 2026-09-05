@@ -5,8 +5,11 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
@@ -16,6 +19,13 @@ import (
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+)
+
+const (
+	mkdirConflictMessage          = "file is doloading[同名冲突]"
+	mkdirVisibilityAttempts       = 6
+	mkdirVisibilityInitialBackoff = 200 * time.Millisecond
+	mkdirVisibilityMaxBackoff     = 800 * time.Millisecond
 )
 
 type QuarkOrUC struct {
@@ -78,7 +88,7 @@ func (d *QuarkOrUC) Link(ctx context.Context, file model.Obj, args model.LinkArg
 	}, nil
 }
 
-func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
 	data := base.Json{
 		"dir_init_lock": false,
 		"dir_path":      "",
@@ -86,12 +96,107 @@ func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName st
 		"pdir_fid":      parentDir.GetID(),
 	}
 	_, err := d.request("/file", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
+		req.SetContext(ctx).SetBody(data)
 	}, nil)
-	if err == nil {
-		time.Sleep(time.Second)
+	if err != nil && err.Error() != mkdirConflictMessage {
+		return nil, err
 	}
-	return err
+
+	// Quark may acknowledge a mkdir before /file/sort reflects the new
+	// directory. Confirm visibility and return the verified object so op.MakeDir
+	// can update an existing parent cache directly instead of immediately
+	// re-listing the eventually-consistent backend.
+	obj, listed, visibilityErr := d.waitForDirVisible(ctx, parentDir.GetID(), dirName)
+	if visibilityErr == nil {
+		return obj, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		// Preserve the existing Quark conflict error when the directory cannot
+		// be confirmed. A same-name conflict is only treated as success after
+		// the matching directory is visible in the parent listing.
+		return nil, err
+	}
+	if !listed {
+		// The create request succeeded, but every visibility probe failed before
+		// producing a usable listing. Preserve the successful mkdir result rather
+		// than turning an unrelated listing outage into a false create failure.
+		// Returning a nil object with nil error makes op.MakeDir clear the parent
+		// cache, which is safer than leaving a potentially stale listing in place.
+		return nil, nil
+	}
+	return nil, visibilityErr
+}
+
+func (d *QuarkOrUC) waitForDirVisible(ctx context.Context, parentID, dirName string) (model.Obj, bool, error) {
+	backoff := mkdirVisibilityInitialBackoff
+	var lastErr error
+	listed := false
+	for attempt := 0; attempt < mkdirVisibilityAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, listed, err
+		}
+
+		obj, err := d.findDir(ctx, parentID, dirName)
+		if err == nil {
+			listed = true
+			if obj != nil {
+				return obj, true, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if attempt == mkdirVisibilityAttempts-1 {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, listed, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < mkdirVisibilityMaxBackoff {
+			backoff *= 2
+			if backoff > mkdirVisibilityMaxBackoff {
+				backoff = mkdirVisibilityMaxBackoff
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return nil, listed, fmt.Errorf("failed to confirm created directory %q: %w", dirName, lastErr)
+	}
+	return nil, listed, fmt.Errorf("created directory %q did not become visible after %d attempts", dirName, mkdirVisibilityAttempts)
+}
+
+func (d *QuarkOrUC) findDir(ctx context.Context, parentID, dirName string) (model.Obj, error) {
+	const size = 100
+	query := map[string]string{
+		"pdir_fid":     parentID,
+		"_size":        strconv.Itoa(size),
+		"_fetch_total": "1",
+	}
+	for page := 1; ; page++ {
+		query["_page"] = strconv.Itoa(page)
+		var resp SortResp
+		_, err := d.request("/file/sort", http.MethodGet, func(req *resty.Request) {
+			req.SetContext(ctx).SetQueryParams(query)
+		}, &resp)
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range resp.Data.List {
+			file.FileName = html.UnescapeString(file.FileName)
+			if !file.File && file.FileName == dirName {
+				return fileToObj(file), nil
+			}
+		}
+		if page*size >= resp.Metadata.Total {
+			return nil, nil
+		}
+	}
 }
 
 func (d *QuarkOrUC) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
