@@ -185,8 +185,11 @@ func (d *QuarkOrUC) waitUploadedObjectVisible(ctx context.Context, pre UpPreResp
 				if obj.IsDir() {
 					continue
 				}
-				if pre.Data.Fid != "" && obj.GetID() == pre.Data.Fid {
-					return true, nil
+				if pre.Data.Fid != "" {
+					if obj.GetID() == pre.Data.Fid {
+						return true, nil
+					}
+					continue
 				}
 				if obj.GetName() == fileName && obj.GetSize() == fileSize {
 					return true, nil
