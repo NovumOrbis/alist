@@ -1,0 +1,37 @@
+name: quark-upload-finish-fallback-validation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: |
+          files="drivers/quark_uc/driver.go drivers/quark_uc/upload_reliability.go drivers/quark_uc/upload_reliability_test.go drivers/quark_uc/upload_reliability_hardening_test.go"
+          out="$(gofmt -l $files)"
+          if [ -n "$out" ]; then
+            printf '%s\n' "$out"
+            exit 1
+          fi
+      - name: Vet Quark driver
+        run: go vet ./drivers/quark_uc
+      - name: Test Quark driver
+        run: go test ./drivers/quark_uc
+      - name: Race test Quark driver
+        run: go test -race ./drivers/quark_uc
+      - name: Shuffled repeated race test
+        run: go test -race -shuffle=on -count=2 ./drivers/quark_uc
+      - name: Test op and WebDAV
+        run: go test ./internal/op ./server/webdav
