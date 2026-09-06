@@ -74,7 +74,7 @@ func (d *QuarkOrUC) Init(ctx context.Context) error {
 		d.AdditionVersion = 3
 		op.MustSaveDriverStorage(d)
 	}
-	// 定时刷新 __puus，避免会话 cookie 不过期（见 AlistGo/alist#830）
+	// 定时刷新 __puus，避免会话 cookie 过期后下载 403（见 AlistGo/alist#830）
 	d.startRefreshLoop()
 	return err
 }
