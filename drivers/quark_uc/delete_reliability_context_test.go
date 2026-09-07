@@ -17,7 +17,11 @@ func TestRemoveReliableCancelsInFlightDeleteRequest(t *testing.T) {
 			return
 		}
 		started <- struct{}{}
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+			http.Error(w, "request context was not canceled", http.StatusInternalServerError)
+		}
 	}))
 	defer srv.Close()
 
@@ -42,7 +46,7 @@ func TestRemoveReliableCancelsInFlightDeleteRequest(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err=%v, want context.Canceled", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("Remove did not return after cancellation")
 	}
 }
