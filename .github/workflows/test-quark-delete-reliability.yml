@@ -1,0 +1,38 @@
+name: test-quark-delete-reliability
+
+on:
+  pull_request:
+    branches: [ 'main' ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Check formatting
+        run: |
+          test -z "$(gofmt -l drivers/quark_uc/driver.go drivers/quark_uc/delete_reliability.go drivers/quark_uc/delete_reliability_test.go drivers/quark_uc/delete_reliability_context_test.go)"
+
+      - name: Vet Quark driver
+        run: go vet ./drivers/quark_uc
+
+      - name: Test Quark driver
+        run: go test ./drivers/quark_uc
+
+      - name: Race test Quark driver
+        run: go test -race ./drivers/quark_uc
+
+      - name: Shuffled repeated race test
+        run: go test -race -shuffle=on -count=2 ./drivers/quark_uc
+
+      - name: Test op and WebDAV
+        run: go test ./internal/op ./server/webdav
