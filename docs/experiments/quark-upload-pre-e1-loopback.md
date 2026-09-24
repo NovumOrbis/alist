@@ -42,21 +42,45 @@ The first E1 commit exercises these exact baseline paths:
 3. HTTP 200 + provider rejection can be decoded into `UpPreResp` while the
    separate error envelope remains zero, so the request helper can return nil.
 4. A zero PRE followed by an equally misclassified hash response can reach the
-   divide-by-zero panic in `Put`.
-5. A source Resty client with `RetryCount(3)` can issue four wire PRE attempts
-   for a transport error even though `upPreReliable` has no explicit retry
-   loop.
-6. Caller cancellation after PRE starts does not cancel the in-flight request
-   because the current PRE request does not carry the caller context.
+   exact `runtime.Error` integer divide-by-zero panic in `Put`. The test owns
+   a temporary directory explicitly and requires the loopback server to observe
+   PRE followed by hash before accepting that panic.
+5. The production `base.NewRestyClient()` retry settings, with only its
+   transport replaced by a synthetic no-network RoundTripper, can issue four
+   wire PRE attempts for a transport error even though `upPreReliable` has no
+   explicit retry loop.
+6. Caller cancellation after PRE starts does not propagate into the current
+   PRE request context. The synthetic transport inspects `req.Context()` after
+   cancellation and is context-aware, so this characterization is expected to
+   fail once PRE correctly attaches the caller context.
 7. HTTP 307 preserves and replays the PRE POST and body.
 8. HTTP 302 converts the POST redirect follow-up into GET.
-9. Explicit provider errors are staged as PRE failures for both Quark and UC
-   configuration names.
+9. Explicit provider errors are staged as PRE failures under Quark and UC PRE
+   configuration values. The loopback cases use the provider-specific `pr`
+   and Referer values while replacing only the API origin with the test server.
 10. Cancellation before PRE starts emits no request.
 
 These are **baseline characterization assertions**. They intentionally describe
 unsafe or ambiguous behavior that the next hardening candidate must reverse.
 They are not intended as permanent regression expectations for a fixed runtime.
+
+## Corrective review status
+
+An independent read-only review of the preceding head
+`d1d80e4061075785737b29242bdde50b8c4599a4` found two blocking test defects:
+
+- the panic characterization could fail before HTTP because the package's
+  relative temp directory did not exist, and it accepted any panic rather than
+  the documented divide-by-zero;
+- the in-flight cancellation transport ignored `req.Context()`, so the test
+  would still pass after the intended context-propagation fix.
+
+The current corrective changes make both tests independently diagnostic. They
+also bind the 1+3 retry test to `base.NewRestyClient()` and exercise the
+provider-specific Quark/UC PRE `pr` and Referer values on loopback.
+
+This document does **not** claim the corrected exact head has passed the
+targeted/repeat/race/shuffle/vet gate yet. That is the next independent gate.
 
 ## Next E1 step
 
