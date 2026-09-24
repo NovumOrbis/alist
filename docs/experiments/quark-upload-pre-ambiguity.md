@@ -408,13 +408,13 @@ assume unknown tasks were cleaned. Record any residual allocation as unresolved.
 
 - Read-only source audit at the pinned baseline and Resty v2.14.0.
 - Initial offline Python lab: 23 top-level tests passed.
-- Second corrective offline Python lab after targeted re-audit: **34 top-level
-  tests passed**, including baseline-compatible upload_url slicing, later-null
-  preservation for modeled Go scalar fields, a non-ASCII full-casefold
-  counterexample, stricter PRE structural fields, int64 boundaries, malformed
-  constants, and bounded evidence parsing.
-- `python3 -m py_compile docs/experiments/quark_upload_pre_lab.py`: passed for
-  the corrective lab.
+- The second corrective offline Python lab now contains **34 top-level test
+  methods**, adding baseline-compatible upload_url slicing, later-null
+  preservation for modeled Go scalar fields, and a non-ASCII full-casefold
+  counterexample. The newly changed URL/JSON helper logic was sanity-checked in
+  isolation in the corrective session; a fresh full-file 34-test run and
+  py_compile are required in the next independent targeted re-audit before they
+  are recorded as passing for this exact head.
 - Documentation and lab only; production Go tree unchanged.
 - No real-provider experiment, NAS command, task allocation, upload or deletion
   was performed for this Draft or corrective.
