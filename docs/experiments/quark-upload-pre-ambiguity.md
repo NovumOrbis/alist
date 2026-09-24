@@ -2,10 +2,10 @@
 
 Status: **DRAFT RESEARCH / NOT A RECOVERY IMPLEMENTATION**.
 
-This follow-up to #9643 documents an observed reliability gap and the evidence
-needed before changing `/file/upload/pre` replay policy. It changes no production
-Go code, shared client configuration, credentials, workflows, or deployed NAS.
-It is separate from the DELETE work in #9651.
+This follow-up to AlistGo/alist#9643 documents an observed reliability gap and
+the evidence needed before changing `/file/upload/pre` replay policy. It changes
+no production Go code, shared client configuration, credentials, workflows, or
+deployed NAS. It is separate from the DELETE work in AlistGo/alist#9651.
 
 ## 1. Frozen scope and evidence boundary
 
@@ -32,11 +32,20 @@ collection time. This is not proof that the provider did not allocate a task,
 that no other log contains recovery, or that data is absent from the provider.
 There is no denominator from which to estimate a failure rate.
 
+If the running binary used the audited baseline helper, surfacing the exact
+message-only `inner error, requestId ...` implies the final Resty response was
+parsed as an error envelope strongly enough to populate `Resp.Message` and
+trigger the helper's status/code check. Under that binary assumption, the six
+logged events are not examples of the separate HTTP-200 provider-error, HTML, or
+empty-JSON false-success shapes discussed below. The currently running NAS
+binary has not been freshly fingerprinted, so this remains a bounded inference,
+not an incident fact.
+
 A nearby part-stage error was retried and followed by PUT 201. The later lock
-DELETE was logged as 204. Neither proves that #9651's exact binary was deployed.
-The current NAS executable hash/build identity has not been freshly verified.
-The #9643 description distinguishes earlier deployed combined candidate
-`26bc4f937a213f44437a5db9a8318e9d317fae53` from its final upstream candidate [S2].
+DELETE was logged as 204. Neither proves that AlistGo/alist#9651's exact binary
+was deployed. The AlistGo/alist#9643 description distinguishes the earlier
+deployed combined candidate `26bc4f937a213f44437a5db9a8318e9d317fae53`
+from its final upstream candidate [S2].
 
 Raw operator logs are intentionally not committed: they include private paths,
 host identifiers and provider request identifiers. The table is a minimized
@@ -61,38 +70,63 @@ allocation. An `inner error` message is not a non-allocation certificate.
 `upPre` uses the shared request helper. Its production client has
 `RetryCount(3)` [S4] [S5]. Resty v2.14.0's backoff loop can execute an eligible
 transport-error operation once plus three retries [S6]. Provider-envelope
-classification happens after `Execute`; the six message-only log events do
-not prove that these internal transport retries occurred in those incidents.
+classification happens after `Execute`; the six message-only log events do not
+prove that these internal transport retries occurred in those incidents.
 
 **Finding:** a pre request whose response is lost can be replayed below the
 driver. A future no-replay implementation must test production retry settings,
 not only a test client with retries disabled. It must not temporarily mutate
-the shared client's retry count or call a concurrency-unsafe client clone.
+the shared client's retry count or use a concurrency-unsafe shared-client
+mutation as a per-request control.
 
 Disabling Resty retries alone is not an exactly-once guarantee. The test plan
-must also account for HTTP 307/308 redirects, custom RoundTrippers, middleware,
-and idempotency-header-driven transport behavior [S7]. No conclusion here is
-made about provider-side duplication in the absence of a wire-level trace.
+must also account for net/http redirect behavior, including POST replay on
+307/308, 301/302/303 method conversion, custom RoundTrippers, and middleware
+[S7] [S14]. No conclusion here is made about provider-side duplication in the
+absence of a wire-level trace.
 
-### A3. The error path discards allocation evidence
+### A3. Error decoding can discard allocation evidence or create false PRE success
 
 `requestWithCookie` registers `SetResult(&UpPreResp)` through its caller, but
-registers `SetError(&Resp)` separately [S4]. Resty v2.14.0 decodes 2xx into
-Result and >=400 into Error [S8]. `Resp` only has status/code/message, whereas
-`UpPreResp.Data` has task_id/fid/upload_id and other upload fields [S9]. On a
-recognized provider error the helper returns `nil, errors.New(e.Message)`.
+registers `SetError(&Resp)` separately [S4]. For JSON/XML content types, Resty
+v2.14.0 decodes 2xx responses into Result and responses >=400 into Error [S8].
+Non-JSON/XML bodies are not decoded by that path, and an unmarshal failure while
+decoding an error body is logged by Resty rather than returned as the request
+error [S8]. `Resp` only has status/code/message, whereas `UpPreResp.Data` has
+task_id/fid/upload_id and other upload fields [S9]. On a recognized provider
+error the helper reduces the result to `errors.New(e.Message)`.
 
-**Finding:** even if a non-2xx raw response contained task identifiers, that
-information would not reach `upPreReliable` through `UpPreResp.Data` on this
-path. Empty fields in the returned Go struct or current log are not evidence
-that the raw response lacked identifiers or that allocation did not happen.
+**Finding 1 - evidence loss:** even if a non-2xx raw response contained task
+identifiers, those fields would not reach `upPreReliable` through
+`UpPreResp.Data` on this path. Empty fields in the returned Go struct or current
+logs are not evidence that the raw response lacked identifiers or that
+allocation did not happen.
 
-The helper also lacks independent HTTP-error rejection and explicit validation
-of the 2xx provider envelope. HTTP 500 with `{}` or non-JSON can leave `e` zero;
-HTTP 200 with a provider error populates Result instead of Error. `upPreReliable`
-does not validate those fields before returning. This is a code-path finding,
-not a claim that one of the six logged incidents used these wire shapes, nor
-proof that the entire upload would subsequently return success.
+**Finding 2 - false PRE success:** the helper has no independent HTTP-status
+rejection and does not validate the PRE success envelope. HTTP >=400 with `{}`,
+HTML, malformed JSON, or an error body whose status/code do not populate `Resp`
+can leave the helper's `e` zero and return `nil` error with a zero
+`UpPreResp`. HTTP 200 with a provider-error envelope is decoded into Result, not
+the separate Error object, so the helper's `e` check can also remain zero. 201,
+204, and redirect edge shapes require explicit treatment rather than being
+assumed to be valid PRE success.
+
+That zero-valued PRE is not harmless. `Put` immediately calls hash with the
+empty task ID. If the downstream hash response is also misclassified as a
+nil-error non-finish result, `Put` uses `pre.Metadata.PartSize == 0` and reaches
+`total / partSize`, causing an integer divide-by-zero panic [S12]. A later path
+also slices `UploadUrl[7:]`, so an empty/short URL is another structural hazard
+[S4]. An independent loopback review reproduced the divide-by-zero path with
+synthetic responses; whether real Quark emits those shapes is not established.
+
+The minimum structural PRE gate used by this research plan is therefore
+stricter than merely having task_id/fid. Before the existing upload pipeline is
+allowed to continue, a proposed validator must require an explicit HTTP 200,
+provider status 200/code 0, non-empty task_id, fid, upload_id, obj_key, bucket,
+a structurally usable upload_url, non-empty auth_info, and `part_size > 0`.
+This is a defensive baseline requirement derived from fields used by the
+current pipeline; it is not a provider protocol specification and still does
+**not** prove upload completion.
 
 ### A4. Pre-call cancellation is not in-flight cancellation
 
@@ -105,31 +139,51 @@ about cancellation must not be interpreted as an in-flight guarantee.
 cancelled request is never proof that allocation did not occur. Do not retry
 using a detached background context to work around cancellation.
 
-### A5. Same-name matching can violate overwrite safety
+### A5. Overwrite state makes false PRE success a data-safety concern
 
-Quark sets `NoOverwriteUpload=true` [S10]. `op.Put` can rename a nonempty old
-object to `.alist_to_delete`, attempt the upload, restore it on failure, or
-remove it on reported success [S11]. The rollback itself can fail; a zero-byte
-existing object follows a separate delete-before-upload path.
+Quark sets `NoOverwriteUpload=true` [S10]. For a non-empty existing destination,
+`op.Put` can rename the old object to `.alist_to_delete`, attempt the upload,
+restore it on a returned upload error, or remove it after reported success
+[S11]. That restoration/removal logic is inline after the driver call, not a
+deferred rollback. Therefore a panic inside the driver can bypass the restore
+step and leave the old object under the temporary name. The false-PRE-success
+panic chain in A3 is a concrete synthetic example of this baseline risk.
+
+Other overwrite states need separate tests rather than being collapsed into the
+normal non-empty case:
+
+- a zero-byte existing destination is deleted before upload and has no rename
+  fallback to restore;
+- a stale `<name>.alist_to_delete` from an earlier failed restore can make the
+  next rename collide;
+- stale cache state can change whether `op.Put` believes an old object exists;
+- `Remove(tempPath)` can fail after a real upload success;
+- rollback rename itself can fail and must remain visible as an unresolved
+  safety event.
 
 **Design constraint:** never report upload success merely because a same-name,
-same-size, or same-hash object is visible after ambiguous pre. Such an object
-may predate this attempt. A false success can trigger removal of the old
-fallback. A PRE task/FID, even if recovered exactly, is not terminal upload
-completion. Identity and completion are distinct predicates.
+same-size, or same-hash object is visible after ambiguous PRE. Such an object
+may predate this attempt. A PRE task/FID, even if recovered exactly, is not
+terminal upload completion. Identity and completion are distinct predicates.
+
+The baseline already has a narrower later-stage exception: after commit,
+`upFinishReliable` can treat visibility of the exact pre-allocated FID as
+success only after its bounded finish retry budget is exhausted [S3]. That
+existing finish-stage heuristic does not generalize to ambiguous PRE, where the
+client may not possess a trustworthy attempt identity at all.
 
 ### A6. same_path_reuse is a clue, not an approved mechanism
 
 `upPre` contains a commented-out `same_path_reuse` field and creates fresh local
-timestamps on each call [S4]. No idempotency contract for this field, request ID,
-or a client-generated key was found in the audited source and bounded public
-search. A more useful primary historical source is PR #1604 (2022): its initial
-same-path overwrite claim was challenged after merge; the author reported
-hash-dependent behavior, and the discussion records the attempted fix being
-overwritten after it failed validation [S13]. These are old contributor and
-maintainer observations, not a current provider-issued guarantee. In particular,
-reuse/deduplication of a completed file does not prove deduplication of an
-unfinished PRE task whose response was lost.
+timestamps on each call [S4]. No current provider-issued idempotency contract
+for this field, request ID, or a client-generated key was found in the audited
+source and bounded public search. A more useful primary historical source is
+AlistGo/alist#1604 (2022): its initial same-path overwrite claim was challenged
+after merge; the author reported hash-dependent behavior, and the discussion
+records the attempted fix being overwritten after it failed validation [S13].
+These are old contributor and maintainer observations, not a current provider
+guarantee. In particular, reuse/deduplication of a completed file does not prove
+deduplication of an unfinished PRE task whose response was lost.
 
 **Decision:** do not enable this field, invent an idempotency header, recover by
 path, or assume the generic `/task` endpoint supports upload-session recovery.
@@ -142,13 +196,19 @@ These rules are proposed acceptance criteria, not installed driver behavior:
 
 | Observation | Permitted conclusion / action |
 | --- | --- |
-| Explicit valid PRE response with usable task identity | Continue the established upload protocol; not upload success |
+| Explicit HTTP 200 + provider 200/0 PRE with all minimum structural fields valid | Continue the established upload protocol; **not** upload success |
+| PRE missing any required structural field or `part_size <= 0` | Stop/fail closed; do not call hash/part and do not infer non-allocation |
 | Error envelope or transport failure without identity | Allocation UNKNOWN; no automatic PRE replay |
 | Error envelope containing task/FID | Candidate evidence only; no automatic resume/finish/delete |
 | Bounded parent listing has no matching file | Allocation UNKNOWN; hidden tasks and stale listings remain possible |
 | Same-name/size/hash match | Not proof of this attempt's identity or completion |
 | Cancelled caller | Stop; no background retry or success inference |
 | Documented non-allocation rejection or verified dedup protocol | Separately review a narrowly bounded recovery implementation |
+
+Minimum structural fields for the first row are: non-empty task_id, fid,
+upload_id, obj_key, bucket, auth_info; a structurally usable upload_url; and a
+positive integer part_size. Callback semantics and other provider fields may
+need further validation before a production validator is finalized.
 
 A single attempted PRE can still leave one unknown allocation if its response
 is lost. No-replay limits additional allocations; it does **not** guarantee
@@ -165,14 +225,19 @@ Run only the adjacent standard-library model:
 python3 docs/experiments/quark_upload_pre_lab.py
 ```
 
-It demonstrates two histories with identical client-visible failures but
-allocation counts zero and one; empty listing ambiguity; extra allocation from
-blind replay; and conservative evidence projection. It also tests missing/null
-fields, malformed responses, ambiguous IDs, cancellation, and secret exclusion.
+It contains illustrative counterexamples with two histories that have identical
+client-visible failures but allocation counts zero and one; empty-listing
+ambiguity; extra allocation from blind replay; and a conservative PRE structure
+gate. The evidence projection keeps a raw-shape summary and a targeted
+Go-decoder projection separate, including case-insensitive/duplicate-key
+fixtures, missing/null fields, malformed UTF-8/JSON, bounded body inspection,
+ambiguous IDs, cancellation, and secret exclusion.
 
 The model has no networking or credential discovery. All identifiers are
 synthetic. It is **not** an AList/Resty integration test, a provider probe, or
-proof that any proposed production implementation is correct.
+proof that any proposed production implementation is correct. Its ambiguity
+fixtures are intentionally counterexamples, not a simulation of Quark's hidden
+state machine.
 
 ### E1. Actual-driver fault injection - required before runtime changes
 
@@ -183,22 +248,35 @@ Tests must restore globals and avoid parallel global-client mutation.
 
 Required matrix:
 
-1. Explicit normal PRE success: preserve request fields and continue once.
+1. Explicit normal PRE success: validate every minimum structural field, preserve
+   request fields, and continue once. Invalid PRE must make **zero** hash/part
+   calls, return an error without panic, and exercise overwrite rollback when
+   `op.Put` already renamed an old object.
 2. Explicit error before allocation and error after allocation: same envelope,
    different private server state. Neither permits an additional PRE.
-3. Allocation followed by connection EOF/reset or a lost response with a real
-   `RetryCount=3` source client: count wire PRE calls, not wrapper calls.
+3. Allocation followed by connection EOF/reset, client timeout, response loss,
+   or 200 headers plus a partial body with a real `RetryCount=3` source client:
+   count wire PRE calls, not wrapper calls.
 4. HTTP 500 with empty, incomplete, HTML, malformed JSON and identifier-bearing
-   bodies; HTTP 200 with provider rejection; HTTP 204/201; missing/null fields.
-5. Cancel before request and while the server is blocked: prompt return, no
-   hidden replay; assert that an earlier remote allocation remains unknown.
-6. 307/308 redirect preserving the POST, same-origin and cross-origin: prevent
-   unobserved PRE replay without changing global redirect policy.
+   bodies; HTTP 200 with provider rejection; HTTP 201/204; missing/null fields;
+   duplicate and case-variant JSON keys; zero/negative part_size; empty/short
+   upload_url. Assert fail-closed behavior before hash/part.
+5. Cancel before request, while the server is blocked, and during retry backoff:
+   prompt return, no hidden replay after cancellation; an earlier remote
+   allocation remains UNKNOWN.
+6. 307/308 redirect preserving POST/body and 301/302/303 method conversion,
+   tested for same-origin and cross-origin targets. Prevent unobserved PRE replay
+   without changing global redirect policy; count redirect hops separately from
+   Resty Request.Attempt.
 7. Custom transport/middleware, response-plus-error, cookie refresh, UA, timeout,
    proxy/TLS settings: no global mutation and no credential logging.
-8. Failed overwrite with a pre-existing synthetic file: old FID and bytes remain
-   recoverable; never clean `.alist_to_delete` on unproven success.
-9. Keep hash/part/commit/finish behavior and unrelated Quark/UC callers unchanged.
+8. Overwrite cases: non-empty destination, zero-byte destination, stale
+   `.alist_to_delete`, stale cache, rollback-rename failure, and temp-object
+   remove failure after real success. On unproven PRE success never remove the
+   old fallback; on panic-capable baseline shapes the regression must prove the
+   proposed validator returns before the panic path.
+9. Run the relevant PRE matrix under both Quark and UC conf values. Keep
+   hash/part/commit/finish behavior and unrelated callers unchanged.
 
 Run Go 1.25+ package vet/test/race/shuffle and internal/op + server/webdav tests
 on the exact proposed runtime candidate, plus regression proof against baseline.
@@ -206,10 +284,18 @@ This document does not claim those tests have been executed for new runtime code
 
 ### E2. Passive response evidence - requires a separate deployment decision
 
-First fingerprint the *running* NAS executable, configuration source, UTC
-clock and log timezone. Do not infer the binary from the DSM package label or
-GitHub PR state. No restart, binary replacement or debugger attachment is
-included in this Draft.
+First fingerprint the *running* NAS executable, configuration source, UTC clock
+and log timezone. Do not infer the binary from the DSM package label or GitHub
+PR state. No restart, binary replacement or debugger attachment is included in
+this Draft.
+
+Before adding instrumentation, use the existing service capture to look for
+Resty's retry logger lines such as `Attempt N` around known PRE incidents. Resty
+can emit per-attempt errors through its own logger/stderr path, which may be
+separate from AList's logrus file. Absence of such lines is not evidence of one
+wire request if stderr was not retained. If diagnostic instrumentation later
+records `Request.Attempt`, treat it as a Resty execution count only; redirect
+hops must be counted separately.
 
 A separately reviewed diagnostic change may observe an already-authorized
 normal request **without adding a PRE**, before the helper discards its response.
@@ -220,14 +306,19 @@ Public/exportable evidence uses an allowlist only:
 
 - a random local event ID unrelated to the account; exact tested build/tree;
 - HTTP status, content-type category, bounded body length, parse outcome;
-- presence/type/value of integer provider status/code, preserving missing/null;
-- presence/type/nonempty flags for task_id/fid/upload_id; no actual values;
-- request count, stage, cancellation/transport-error category, elapsed time;
+- a raw-shape summary (presence, matching-key count, case-variant indicator) for
+  known envelope keys, without arbitrary key/value export;
+- a targeted Go-decoder projection for provider status/code and the
+  presence/type/nonempty state of task_id/fid/upload_id, preserving
+  missing/null/invalid distinctions and duplicate/case-fold behavior;
+- request count, redirect-hop count, stage, cancellation/transport-error
+  category, elapsed time;
 - `ALLOCATION_STATE=UNKNOWN` unless independently established.
 
 Do not export cookies, Authorization, auth_info, signed URLs, OSS keys, callback
 bodies, filenames, parent FIDs, full provider messages, or raw JSON. Capture
-only at the PRE boundary, with a strict size cap, not a shared/global hook.
+only at the PRE boundary with a strict **read-time** size cap, not by reading an
+unbounded body and truncating afterward, and not through a shared/global hook.
 If exact IDs are necessary for local follow-up, keep a separate owner-only,
 0600, time-limited private record; share only random/HMAC event labels. The key
 and raw record stay local. An instrumentation failure must not change the
@@ -258,10 +349,13 @@ absence is inconclusive. Do not guess task IDs or infer that generic task
 statuses mean terminal upload durability.
 
 `same_path_reuse` duplicate-allocation/overwrite testing is a separate,
-explicitly authorized subexperiment; it is not included in the three-call
-plan. Validate same key/same request, conflicting content, concurrent callers,
-timeout/restart and retention-window cases before considering production use.
-Even positive trial results need a defensible provider contract.
+explicitly authorized subexperiment; it is not included in the three-call plan.
+If authorized later, it **inherits E3's hard invocation budget, stop-on-unknown
+rule, exact-ID ownership requirement, and cleanup accounting** unless a stricter
+subexperiment budget is approved. Validate same key/same request, conflicting
+content, concurrent callers, timeout/restart and retention-window cases before
+considering production use. Even positive trial results need a defensible
+provider contract.
 
 Cleanup: only known synthetic objects/tasks with independently verified
 ownership, separate confirmation, and documented provider semantics. Never
@@ -271,27 +365,41 @@ assume unknown tasks were cleaned. Record any residual allocation as unresolved.
 ## 5. Path from this Draft to an implementation
 
 1. Agree on evidence schema and protocol questions; establish deployed identity.
-2. Add narrowly scoped PRE response validation, in-flight context and no-replay
-   transport handling only after actual-driver fault-injection tests exist.
-   Do not broaden shared request semantics or mutate shared Resty configuration.
-3. Resolve non-allocation/idempotency/resume semantics in the isolated evidence
+2. Add actual-driver tests for strict PRE envelope/structure validation,
+   in-flight context and no-replay transport handling before changing runtime
+   behavior. Do not broaden shared request semantics or mutate shared Resty
+   configuration.
+3. The first runtime hardening candidate, if supported by E1, is limited to
+   observation/no-replay/fail-closed PRE mechanics. It must reject invalid PRE
+   before hash/part, avoid panic, and preserve overwrite rollback. This is not
+   automatic PRE recovery.
+4. Resolve non-allocation/idempotency/resume semantics in the isolated evidence
    phase. Returned IDs alone are not permission to continue a failed task.
-4. Only then propose bounded recovery. Require exact attempt identity, upload
+5. Only then propose bounded recovery. Require exact attempt identity, upload
    completion proof, overwrite preservation, cleanup accounting, and no hidden
    extra PRE calls. Tests must fail on the old unsafe behavior, not mirror code.
-5. Independent review + full exact-candidate Go gate + explicit deployment
-   authorization precede production use. This Draft must not be marked ready
-   as an incident fix merely because its offline model tests pass.
+6. Independent review + full exact-candidate Go gate + explicit deployment
+   authorization precede production use. This Draft must not be marked ready as
+   an incident fix merely because its offline model tests pass.
 
 ## 6. Validation performed for this research Draft
 
 - Read-only source audit at the pinned baseline and Resty v2.14.0.
-- Offline Python lab: 23 top-level tests passed, including parameterized cases.
+- Initial offline Python lab: 23 top-level tests passed.
+- Corrective offline Python lab after adversarial review: **31 top-level tests
+  passed**, including stricter PRE structural fields, duplicate/case-fold JSON
+  shapes, int64 boundaries, malformed constants, and bounded evidence parsing.
+- `python3 -m py_compile docs/experiments/quark_upload_pre_lab.py`: passed for
+  the corrective lab.
 - Documentation and lab only; production Go tree unchanged.
-- No real-provider experiment, NAS command, task allocation, upload or deletion.
-- No claim of a new AList Go test gate or upstream CI result. The working
-  environment could not resolve GitHub for a full checkout and has Go 1.23.2,
-  older than the baseline requirement. Source was read using the GitHub connector.
+- No real-provider experiment, NAS command, task allocation, upload or deletion
+  was performed for this Draft or corrective.
+- An independent read-only review used loopback-only synthetic fault injection
+  to reproduce four-wire Resty retry cases and the zero-PRE divide-by-zero
+  baseline path. Those scratch tests are review evidence, not committed AList
+  regression tests and not a full Go gate.
+- No claim of a new AList full Go test gate or upstream CI result is made for
+  this research Draft.
 
 ## Sources
 
@@ -306,6 +414,6 @@ assume unknown tasks were cleaned. Record any residual allocation as unresolved.
 [S9]: https://github.com/AlistGo/alist/blob/fb0731a6953012e7b72b89bf5473817caa4625f9/drivers/quark_uc/types.go
 [S10]: https://github.com/AlistGo/alist/blob/fb0731a6953012e7b72b89bf5473817caa4625f9/drivers/quark_uc/meta.go
 [S11]: https://github.com/AlistGo/alist/blob/fb0731a6953012e7b72b89bf5473817caa4625f9/internal/op/fs.go
-
 [S12]: https://github.com/AlistGo/alist/blob/fb0731a6953012e7b72b89bf5473817caa4625f9/drivers/quark_uc/driver.go
 [S13]: https://github.com/AlistGo/alist/pull/1604#issuecomment-1238037447
+[S14]: https://pkg.go.dev/net/http#Transport
