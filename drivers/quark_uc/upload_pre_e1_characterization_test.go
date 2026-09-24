@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
+	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/model"
 	streamPkg "github.com/alist-org/alist/v3/internal/stream"
 	"github.com/go-resty/resty/v2"
@@ -101,7 +103,18 @@ func TestE1BaselinePreHTTP200ProviderRejectionCanFalseSucceed(t *testing.T) {
 }
 
 func TestE1BaselinePutCanPanicAfterZeroPre(t *testing.T) {
+	oldTempDir := conf.Conf.TempDir
+	conf.Conf.TempDir = t.TempDir()
+	t.Cleanup(func() {
+		conf.Conf.TempDir = oldTempDir
+	})
+
+	var mu sync.Mutex
+	paths := make([]string, 0, 2)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
 		switch r.URL.Path {
 		case "/1/clouddrive/file/upload/pre", "/1/clouddrive/file/update/hash":
 			w.Header().Set("Content-Type", "application/json")
@@ -115,24 +128,39 @@ func TestE1BaselinePutCanPanicAfterZeroPre(t *testing.T) {
 
 	d := newTestDriver(srv.URL)
 	dst := &model.Object{ID: "parent", Name: "parent", IsFolder: true}
+	var putErr error
 
 	defer func() {
-		if recover() == nil {
-			t.Fatal("baseline Put did not panic after zero-valued PRE/hash responses")
+		r := recover()
+		if r == nil {
+			t.Fatalf("Put returned without expected divide-by-zero panic: %v", putErr)
+		}
+		runtimeErr, ok := r.(runtime.Error)
+		if !ok || !strings.Contains(runtimeErr.Error(), "integer divide by zero") {
+			t.Fatalf("panic=%v, want runtime integer divide by zero", r)
+		}
+		mu.Lock()
+		gotPaths := append([]string(nil), paths...)
+		mu.Unlock()
+		if len(gotPaths) != 2 ||
+			gotPaths[0] != "/1/clouddrive/file/upload/pre" ||
+			gotPaths[1] != "/1/clouddrive/file/update/hash" {
+			t.Fatalf("server paths=%v, want [pre hash]", gotPaths)
 		}
 	}()
-	_ = d.Put(context.Background(), dst, e1UploadStream(), func(float64) {})
+	putErr = d.Put(context.Background(), dst, e1UploadStream(), func(float64) {})
 }
 
 func TestE1BaselinePreTransportErrorUsesOnePlusThreeRestyAttempts(t *testing.T) {
 	var mu sync.Mutex
 	attempts := 0
-	client := resty.NewWithClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	client := base.NewRestyClient()
+	client.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		mu.Lock()
 		attempts++
 		mu.Unlock()
 		return nil, io.ErrUnexpectedEOF
-	})}).SetRetryCount(3).SetRetryResetReaders(true)
+	}))
 
 	d := newTestDriver("http://loopback.invalid")
 	d.client = client
@@ -150,46 +178,52 @@ func TestE1BaselinePreTransportErrorUsesOnePlusThreeRestyAttempts(t *testing.T) 
 
 func TestE1BaselinePreCallerCancellationDoesNotCancelInFlightRequest(t *testing.T) {
 	started := make(chan struct{}, 1)
+	inspectContext := make(chan struct{})
+	requestContextErr := make(chan error, 1)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRequest := func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	}
+	t.Cleanup(releaseRequest)
+
 	client := resty.NewWithClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		started <- struct{}{}
-		<-release
-		headers := make(http.Header)
-		headers.Set("Content-Type", "application/json")
-		return ossResponse(req, http.StatusOK, e1ValidPreBody(), headers), nil
+		<-inspectContext
+		requestContextErr <- req.Context().Err()
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-release:
+			headers := make(http.Header)
+			headers.Set("Content-Type", "application/json")
+			return ossResponse(req, http.StatusOK, e1ValidPreBody(), headers), nil
+		}
 	})})
 
 	d := newTestDriver("http://loopback.invalid")
 	d.client = client
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() {
 		_, err := d.upPreReliable(ctx, e1UploadStream(), "parent")
 		done <- err
 	}()
 
-	select {
-	case <-started:
-		cancel()
-	case <-time.After(2 * time.Second):
-		t.Fatal("PRE request did not start")
+	<-started
+	cancel()
+	close(inspectContext)
+
+	if err := <-requestContextErr; err != nil {
+		t.Fatalf("request context observed caller cancellation; baseline unexpectedly propagated caller ctx: %v", err)
 	}
 
-	select {
-	case err := <-done:
-		close(release)
-		t.Fatalf("request returned after caller cancellation before transport release: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("request after release: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("request did not complete after transport release")
+	releaseRequest()
+	if err := <-done; err != nil {
+		t.Fatalf("request after release: %v", err)
 	}
 }
 
@@ -267,11 +301,28 @@ func TestE1BaselinePre302ConvertsPOSTToGET(t *testing.T) {
 }
 
 func TestE1BaselinePreProviderErrorIsReportedForQuarkAndUC(t *testing.T) {
-	for _, name := range []string{"Quark", "UC"} {
-		t.Run(name, func(t *testing.T) {
+	cases := []struct {
+		name    string
+		referer string
+		pr      string
+	}{
+		{name: "Quark", referer: "https://pan.quark.cn", pr: "ucpro"},
+		{name: "UC", referer: "https://drive.uc.cn", pr: "UCBrowser"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls++
+				if r.URL.Path != "/1/clouddrive/file/upload/pre" {
+					t.Errorf("path=%q, want PRE path", r.URL.Path)
+				}
+				if got := r.URL.Query().Get("pr"); got != tc.pr {
+					t.Errorf("pr=%q, want %q", got, tc.pr)
+				}
+				if got := r.Header.Get("Referer"); got != tc.referer {
+					t.Errorf("Referer=%q, want %q", got, tc.referer)
+				}
 				writeJSON(w, http.StatusInternalServerError, Resp{
 					Status:  500,
 					Code:    500,
@@ -281,7 +332,13 @@ func TestE1BaselinePreProviderErrorIsReportedForQuarkAndUC(t *testing.T) {
 			defer srv.Close()
 
 			d := newTestDriver(srv.URL)
-			d.config.Name = name
+			d.config.Name = tc.name
+			d.conf = Conf{
+				ua:      "e1-test-ua",
+				referer: tc.referer,
+				api:     srv.URL + "/1/clouddrive",
+				pr:      tc.pr,
+			}
 			_, err := d.upPreReliable(context.Background(), e1UploadStream(), "parent")
 			if err == nil || !strings.Contains(err.Error(), "stage pre") || !strings.Contains(err.Error(), "inner error") {
 				t.Fatalf("err=%v, want staged provider error", err)
