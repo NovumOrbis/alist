@@ -4,81 +4,145 @@
 Uses only synthetic data. No networking, credential discovery, provider calls,
 filesystem writes, or runtime imports from AList. Run with Python >= 3.8:
     python3 docs/experiments/quark_upload_pre_lab.py
+
+The ambiguity tests are illustrative counterexamples. They demonstrate why a
+client-visible failure cannot establish provider allocation state; they do not
+model or prove Quark's internal implementation.
 """
 import json
 import unittest
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Dict, List, Optional, Tuple
 
 
 MAX_BODY_BYTES = 65536
+INT64_MIN = -(2 ** 63)
+INT64_MAX = (2 ** 63) - 1
 
 
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
+class PairObject(list):
+    """JSON object represented as ordered key/value pairs, including duplicates."""
 
 
-def _integer_field(obj: Dict[str, Any], key: str) -> Dict[str, Any]:
-    if key not in obj:
+JsonPairs = List[Tuple[str, Any]]
+
+
+def _pairs_object(pairs: JsonPairs) -> PairObject:
+    return PairObject(pairs)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-standard JSON constant: " + value)
+
+
+def _go_field(obj: PairObject, key: str) -> Tuple[bool, Any]:
+    """Approximate encoding/json struct-field matching for audited fields.
+
+    The baseline Go structs use lower-case JSON tags. For the evidence fields we
+    model exact/case-insensitive matching with later matching values replacing
+    earlier ones, which captures the duplicate/case-fold behavior relevant to
+    this research lab.
+    """
+    found = False
+    value: Any = None
+    folded = key.casefold()
+    for candidate, candidate_value in obj:
+        if candidate == key or candidate.casefold() == folded:
+            found = True
+            value = candidate_value
+    return found, value
+
+
+def _raw_key_state(obj: PairObject, key: str) -> Dict[str, Any]:
+    matches = [candidate for candidate, _ in obj if candidate.casefold() == key.casefold()]
+    return {
+        "present": bool(matches),
+        "matching_key_count": len(matches),
+        "case_variant": any(candidate != key for candidate in matches),
+    }
+
+
+def _integer_field(obj: PairObject, key: str) -> Dict[str, Any]:
+    found, value = _go_field(obj, key)
+    if not found:
         return {"state": "missing"}
-    value = obj[key]
     if value is None:
         return {"state": "null"}
-    if type(value) is not int or not -(2 ** 31) <= value < 2 ** 31:
+    if type(value) is not int or not INT64_MIN <= value <= INT64_MAX:
         return {"state": "invalid"}
     return {"state": "integer", "value": value}
 
 
-def _identifier_field(obj: Dict[str, Any], key: str) -> str:
-    if key not in obj:
+def _identifier_field(obj: PairObject, key: str) -> str:
+    found, value = _go_field(obj, key)
+    if not found:
         return "missing"
-    value = obj[key]
     if value is None:
         return "null"
     if not isinstance(value, str):
         return "invalid"
-    return "nonempty" if value.strip() else "empty"
+    return "nonempty" if len(value) > 0 else "empty"
 
 
 def summarize(http_status: Optional[int], body: bytes) -> Dict[str, Any]:
-    """Proposed shape-only evidence projection; never emit raw body or IDs.
+    """Shape-only evidence projection; never emit raw body or identifier values.
 
-    This helper is exercised only with fixtures by this file. It does not
-    authorize capture of real responses or prove that a task was not allocated.
+    The model inspects at most MAX_BODY_BYTES + 1 bytes before deciding whether
+    the body is oversized. A real E2 implementation must enforce the equivalent
+    bound while reading from the response stream, for example with an
+    io.LimitReader-style primitive, rather than buffering an unbounded body.
+
+    The projection records a raw-shape view and a targeted approximation of the
+    baseline Go decoder view separately. It still cannot establish allocation.
     """
     valid_http = type(http_status) is int and 100 <= http_status <= 599
-    result = {"http_status": http_status if valid_http else None,
-              "json_state": "unparsed", "allocation_state": "UNKNOWN"}
-    if len(body) > MAX_BODY_BYTES:
+    result: Dict[str, Any] = {
+        "http_status": http_status if valid_http else None,
+        "json_state": "unparsed",
+        "allocation_state": "UNKNOWN",
+    }
+    bounded = body[: MAX_BODY_BYTES + 1]
+    if len(bounded) > MAX_BODY_BYTES:
         result["json_state"] = "oversized"
         return result
     try:
-        obj = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
+        obj = json.loads(
+            bounded.decode("utf-8"),
+            object_pairs_hook=_pairs_object,
+            parse_constant=_reject_json_constant,
+        )
     except (UnicodeError, ValueError, RecursionError):
         result["json_state"] = "invalid"
         return result
-    if not isinstance(obj, dict):
+    if not isinstance(obj, PairObject):
         result["json_state"] = "not_object"
         return result
+
     result["json_state"] = "object"
-    result["status"] = _integer_field(obj, "status")
-    result["code"] = _integer_field(obj, "code")
-    data = obj.get("data")
-    if "data" not in obj:
-        result["data_state"] = "missing"
+    result["raw_shape"] = {
+        "status": _raw_key_state(obj, "status"),
+        "code": _raw_key_state(obj, "code"),
+        "data": _raw_key_state(obj, "data"),
+    }
+    go_projection: Dict[str, Any] = {
+        "status": _integer_field(obj, "status"),
+        "code": _integer_field(obj, "code"),
+    }
+
+    data_found, data = _go_field(obj, "data")
+    if not data_found:
+        go_projection["data_state"] = "missing"
     elif data is None:
-        result["data_state"] = "null"
-    elif not isinstance(data, dict):
-        result["data_state"] = "invalid"
+        go_projection["data_state"] = "null"
+    elif not isinstance(data, PairObject):
+        go_projection["data_state"] = "invalid"
     else:
-        result["data_state"] = "object"
-        result["identifiers"] = {key: _identifier_field(data, key)
-                                 for key in ("task_id", "fid", "upload_id")}
+        go_projection["data_state"] = "object"
+        go_projection["identifiers"] = {
+            key: _identifier_field(data, key)
+            for key in ("task_id", "fid", "upload_id")
+        }
+    result["go_projection"] = go_projection
     return result
 
 
@@ -89,26 +153,82 @@ class Observation:
     code: Optional[int]
     task_id: Optional[str] = None
     fid: Optional[str] = None
+    upload_id: Optional[str] = None
+    obj_key: Optional[str] = None
+    bucket: Optional[str] = None
+    upload_url: Optional[str] = None
+    auth_info: Optional[str] = None
+    part_size: Optional[int] = None
     transport_error: bool = False
     cancelled: bool = False
 
 
+def valid_pre_observation() -> Observation:
+    return Observation(
+        http_status=200,
+        provider_status=200,
+        code=0,
+        task_id="synthetic-task",
+        fid="synthetic-fid",
+        upload_id="synthetic-upload",
+        obj_key="synthetic-object-key",
+        bucket="synthetic-bucket",
+        upload_url="https://synthetic-upload.invalid",
+        auth_info="synthetic-auth-info",
+        part_size=1024,
+    )
+
+
+def _nonempty_string(value: Optional[str]) -> bool:
+    return isinstance(value, str) and len(value) > 0
+
+
+def _usable_upload_url(value: Optional[str]) -> bool:
+    # The baseline later slices UploadUrl[7:]. Requiring an https:// prefix and
+    # a non-empty suffix prevents the known short/empty structural hazards in
+    # this model; it is not a provider URL contract.
+    return isinstance(value, str) and value.startswith("https://") and len(value) > 8
+
+
 def proposed_next_action(obs: Observation) -> str:
-    """Conservative model only; a PRE handle is NOT upload completion."""
+    """Conservative model only; valid PRE is NOT completed upload evidence."""
     if obs.cancelled:
         return "STOP_CANCELLED"
-    integers = all(type(v) is int for v in
-                   (obs.http_status, obs.provider_status, obs.code))
-    handles = all(isinstance(v, str) and bool(v.strip())
-                  for v in (obs.task_id, obs.fid))
-    if (not obs.transport_error and integers and handles and
-            (obs.http_status, obs.provider_status, obs.code) == (200, 200, 0)):
+    integers = all(
+        type(value) is int
+        for value in (obs.http_status, obs.provider_status, obs.code, obs.part_size)
+    )
+    required_strings = all(
+        _nonempty_string(value)
+        for value in (
+            obs.task_id,
+            obs.fid,
+            obs.upload_id,
+            obs.obj_key,
+            obs.bucket,
+            obs.auth_info,
+        )
+    )
+    envelope_ok = (
+        obs.http_status,
+        obs.provider_status,
+        obs.code,
+    ) == (200, 200, 0)
+    structural_ok = (
+        integers
+        and required_strings
+        and _usable_upload_url(obs.upload_url)
+        and obs.part_size is not None
+        and obs.part_size > 0
+    )
+    if not obs.transport_error and envelope_ok and structural_ok:
         return "CONTINUE_EXISTING_TASK_NOT_UPLOAD_SUCCESS"
     return "STOP_ALLOCATION_UNKNOWN"
 
 
 class SyntheticProvider:
     """Two possible histories, not a claim about Quark's actual internals."""
+
     def __init__(self, allocate_before_error: bool, drop_response: bool = False):
         self.allocate_before_error = allocate_before_error
         self.drop_response = drop_response
@@ -137,6 +257,8 @@ def model_hidden_transport_retry(provider: SyntheticProvider, retries: int):
 
 
 class AmbiguityTests(unittest.TestCase):
+    """Illustrative counterexamples, not a provider implementation model."""
+
     def test_identical_errors_can_hide_different_allocations(self):
         before = SyntheticProvider(False)
         after = SyntheticProvider(True)
@@ -163,42 +285,98 @@ class AmbiguityTests(unittest.TestCase):
 
     def test_no_replay_limits_new_allocations_but_not_orphans(self):
         provider = SyntheticProvider(True, drop_response=True)
-        self.assertEqual(proposed_next_action(provider.pre()),
-                         "STOP_ALLOCATION_UNKNOWN")
+        self.assertEqual(
+            proposed_next_action(provider.pre()), "STOP_ALLOCATION_UNKNOWN"
+        )
         self.assertEqual((provider.calls, provider.allocations), (1, 1))
 
     def test_provider_error_must_not_be_treated_as_nonallocation(self):
-        self.assertEqual(proposed_next_action(Observation(500, 500, 50000)),
-                         "STOP_ALLOCATION_UNKNOWN")
+        self.assertEqual(
+            proposed_next_action(Observation(500, 500, 50000)),
+            "STOP_ALLOCATION_UNKNOWN",
+        )
 
     def test_error_with_identifiers_is_not_permission_to_resume(self):
-        self.assertEqual(proposed_next_action(Observation(
-            500, 500, 50000, "synthetic-task", "synthetic-fid")),
-            "STOP_ALLOCATION_UNKNOWN")
+        obs = replace(
+            valid_pre_observation(),
+            http_status=500,
+            provider_status=500,
+            code=50000,
+        )
+        self.assertEqual(proposed_next_action(obs), "STOP_ALLOCATION_UNKNOWN")
 
-    def test_candidate_handle_is_not_upload_completion(self):
-        self.assertEqual(proposed_next_action(Observation(
-            200, 200, 0, "synthetic-task", "synthetic-fid")),
-            "CONTINUE_EXISTING_TASK_NOT_UPLOAD_SUCCESS")
+    def test_valid_pre_handle_is_not_upload_completion(self):
+        self.assertEqual(
+            proposed_next_action(valid_pre_observation()),
+            "CONTINUE_EXISTING_TASK_NOT_UPLOAD_SUCCESS",
+        )
 
     def test_uncertain_success_shapes_stop(self):
-        for values in ((201, 200, 0), (200, None, 0), (200, 200, None),
-                       (200, 0, 0), (200, 200, False), (200, 200, "0"),
-                       (204, 200, 0), (500, 200, 0)):
-            with self.subTest(values=values):
-                self.assertEqual(proposed_next_action(Observation(
-                    *values, task_id="synthetic-task", fid="synthetic-fid")),
-                    "STOP_ALLOCATION_UNKNOWN")
+        base = valid_pre_observation()
+        for changes in (
+            {"http_status": 201},
+            {"provider_status": None},
+            {"code": None},
+            {"provider_status": 0},
+            {"code": False},
+            {"code": "0"},
+            {"http_status": 204},
+            {"http_status": 500},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(
+                    proposed_next_action(replace(base, **changes)),
+                    "STOP_ALLOCATION_UNKNOWN",
+                )
 
-    def test_missing_handles_stop(self):
-        for task, fid in ((None, None), ("", "f"), ("t", ""), ("t", " ")):
-            with self.subTest(task=task, fid=fid):
-                self.assertEqual(proposed_next_action(Observation(
-                    200, 200, 0, task, fid)), "STOP_ALLOCATION_UNKNOWN")
+    def test_each_required_pre_string_is_fail_closed(self):
+        base = valid_pre_observation()
+        for field in (
+            "task_id",
+            "fid",
+            "upload_id",
+            "obj_key",
+            "bucket",
+            "auth_info",
+        ):
+            for value in (None, ""):
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(
+                        proposed_next_action(replace(base, **{field: value})),
+                        "STOP_ALLOCATION_UNKNOWN",
+                    )
+
+    def test_part_size_must_be_positive_integer(self):
+        base = valid_pre_observation()
+        for value in (None, 0, -1, False, "1024"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    proposed_next_action(replace(base, part_size=value)),
+                    "STOP_ALLOCATION_UNKNOWN",
+                )
+
+    def test_upload_url_must_be_structurally_usable(self):
+        base = valid_pre_observation()
+        for value in (None, "", "https://", "http://host", "synthetic"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    proposed_next_action(replace(base, upload_url=value)),
+                    "STOP_ALLOCATION_UNKNOWN",
+                )
 
     def test_cancelled_observation_never_resumes(self):
-        self.assertEqual(proposed_next_action(Observation(
-            200, 200, 0, "t", "f", cancelled=True)), "STOP_CANCELLED")
+        self.assertEqual(
+            proposed_next_action(replace(valid_pre_observation(), cancelled=True)),
+            "STOP_CANCELLED",
+        )
+
+    def test_transport_error_never_resumes_even_with_complete_fields(self):
+        self.assertEqual(
+            proposed_next_action(
+                replace(valid_pre_observation(), transport_error=True)
+            ),
+            "STOP_ALLOCATION_UNKNOWN",
+        )
 
     def test_completed_file_dedup_does_not_prove_pending_task_dedup(self):
         completed = {("existing.bin", "same-hash"): "completed-fid"}
@@ -211,83 +389,174 @@ class AmbiguityTests(unittest.TestCase):
             pending_tasks.append(task)
             return task
 
-        self.assertEqual(possible_pre("existing.bin", "same-hash"),
-                         possible_pre("existing.bin", "same-hash"))
-        self.assertNotEqual(possible_pre("new.bin", "same-hash"),
-                            possible_pre("new.bin", "same-hash"))
+        self.assertEqual(
+            possible_pre("existing.bin", "same-hash"),
+            possible_pre("existing.bin", "same-hash"),
+        )
+        self.assertNotEqual(
+            possible_pre("new.bin", "same-hash"),
+            possible_pre("new.bin", "same-hash"),
+        )
 
     def test_name_size_hash_equality_does_not_identify_allocation(self):
         old = {"fid": "old", "name": "test.bin", "size": 1, "hash": "same"}
         new = dict(old, fid="new")
-        self.assertEqual({k: old[k] for k in ("name", "size", "hash")},
-                         {k: new[k] for k in ("name", "size", "hash")})
+        self.assertEqual(
+            {key: old[key] for key in ("name", "size", "hash")},
+            {key: new[key] for key in ("name", "size", "hash")},
+        )
         self.assertNotEqual(old["fid"], new["fid"])
 
 
 class EvidenceProjectionTests(unittest.TestCase):
     def test_secrets_and_identifiers_are_not_emitted(self):
-        raw = {"status": 500, "code": 50000,
-               "message": "DO_NOT_EXPORT_SECRET",
-               "Cookie": "DO_NOT_EXPORT_SECRET", "Authorization": "DO_NOT_EXPORT_SECRET",
-               "data": {"task_id": "DO_NOT_EXPORT_SECRET", "fid": "DO_NOT_EXPORT_SECRET",
-                        "upload_id": "DO_NOT_EXPORT_SECRET", "auth_info": "DO_NOT_EXPORT_SECRET",
-                        "obj_key": "DO_NOT_EXPORT_SECRET", "callback": "DO_NOT_EXPORT_SECRET"}}
+        raw = {
+            "status": 500,
+            "code": 50000,
+            "message": "DO_NOT_EXPORT_SECRET",
+            "Cookie": "DO_NOT_EXPORT_SECRET",
+            "Authorization": "DO_NOT_EXPORT_SECRET",
+            "data": {
+                "task_id": "DO_NOT_EXPORT_SECRET",
+                "fid": "DO_NOT_EXPORT_SECRET",
+                "upload_id": "DO_NOT_EXPORT_SECRET",
+                "auth_info": "DO_NOT_EXPORT_SECRET",
+                "obj_key": "DO_NOT_EXPORT_SECRET",
+                "callback": "DO_NOT_EXPORT_SECRET",
+            },
+        }
         out = summarize(500, json.dumps(raw).encode())
         self.assertNotIn("DO_NOT_EXPORT_SECRET", json.dumps(out))
-        self.assertEqual(out["identifiers"]["task_id"], "nonempty")
+        self.assertEqual(
+            out["go_projection"]["identifiers"]["task_id"], "nonempty"
+        )
         self.assertEqual(out["allocation_state"], "UNKNOWN")
 
     def test_absent_ids_do_not_mean_no_allocation(self):
-        self.assertEqual(summarize(500, b'{"status":500,"code":50000}')
-                         ["allocation_state"], "UNKNOWN")
+        out = summarize(500, b'{"status":500,"code":50000}')
+        self.assertEqual(out["allocation_state"], "UNKNOWN")
 
     def test_missing_null_empty_and_invalid_are_distinct(self):
-        for data, state in (({}, "missing"), ({"fid": None}, "null"),
-                            ({"fid": ""}, "empty"), ({"fid": 7}, "invalid")):
+        for data, state in (
+            ({}, "missing"),
+            ({"fid": None}, "null"),
+            ({"fid": ""}, "empty"),
+            ({"fid": 7}, "invalid"),
+        ):
             with self.subTest(state=state):
                 out = summarize(500, json.dumps({"data": data}).encode())
-                self.assertEqual(out["identifiers"]["fid"], state)
+                self.assertEqual(
+                    out["go_projection"]["identifiers"]["fid"], state
+                )
+
+    def test_whitespace_identifier_matches_go_nonempty_shape(self):
+        out = summarize(500, b'{"data":{"fid":" "}}')
+        self.assertEqual(
+            out["go_projection"]["identifiers"]["fid"], "nonempty"
+        )
 
     def test_provider_zero_is_not_missing(self):
-        self.assertEqual(summarize(200, b'{"code":0}')["code"],
-                         {"state": "integer", "value": 0})
-        self.assertEqual(summarize(200, b'{}')["code"], {"state": "missing"})
-        self.assertEqual(summarize(200, b'{"code":null}')["code"], {"state": "null"})
+        self.assertEqual(
+            summarize(200, b'{"code":0}')["go_projection"]["code"],
+            {"state": "integer", "value": 0},
+        )
+        self.assertEqual(
+            summarize(200, b'{}')["go_projection"]["code"],
+            {"state": "missing"},
+        )
+        self.assertEqual(
+            summarize(200, b'{"code":null}')["go_projection"]["code"],
+            {"state": "null"},
+        )
 
     def test_invalid_integer_types(self):
         for value in (False, "0", 0.0, 2 ** 64, [], {}):
             with self.subTest(value=value):
                 out = summarize(200, json.dumps({"code": value}).encode())
-                self.assertEqual(out["code"], {"state": "invalid"})
+                self.assertEqual(
+                    out["go_projection"]["code"], {"state": "invalid"}
+                )
 
-    def test_untrusted_body_is_bounded(self):
-        self.assertEqual(summarize(502, b'x' * (MAX_BODY_BYTES + 1))["json_state"],
-                         "oversized")
+    def test_int64_range_is_modelled(self):
+        self.assertEqual(
+            summarize(200, json.dumps({"code": INT64_MAX}).encode())[
+                "go_projection"
+            ]["code"],
+            {"state": "integer", "value": INT64_MAX},
+        )
+        self.assertEqual(
+            summarize(200, json.dumps({"code": INT64_MAX + 1}).encode())[
+                "go_projection"
+            ]["code"],
+            {"state": "invalid"},
+        )
 
-    def test_html_malformed_unicode_and_duplicate_keys(self):
-        for body in (b'<html>DO_NOT_EXPORT_SECRET</html>', b'{', b'\xff',
-                     b'{"status":200,"status":500}',
-                     b'{"data":{"fid":"a","fid":"b"}}'):
+    def test_untrusted_body_is_bounded_before_json_parse(self):
+        self.assertEqual(
+            summarize(502, b"x" * (MAX_BODY_BYTES + 1))["json_state"],
+            "oversized",
+        )
+
+    def test_html_malformed_unicode_and_nan_are_invalid(self):
+        for body in (
+            b"<html>DO_NOT_EXPORT_SECRET</html>",
+            b"{",
+            b"\xff",
+            b'{"code":NaN}',
+        ):
             with self.subTest(body=body):
                 out = summarize(502, body)
                 self.assertEqual(out["json_state"], "invalid")
                 self.assertNotIn("DO_NOT_EXPORT_SECRET", json.dumps(out))
 
+    def test_duplicate_exact_key_models_go_last_value(self):
+        out = summarize(500, b'{"code":0,"code":31001}')
+        self.assertEqual(
+            out["go_projection"]["code"],
+            {"state": "integer", "value": 31001},
+        )
+        self.assertEqual(out["raw_shape"]["code"]["matching_key_count"], 2)
+
+    def test_case_insensitive_key_models_go_last_matching_value(self):
+        out = summarize(500, b'{"status":200,"code":0,"CODE":31001}')
+        self.assertEqual(
+            out["go_projection"]["code"],
+            {"state": "integer", "value": 31001},
+        )
+        self.assertTrue(out["raw_shape"]["code"]["case_variant"])
+
+    def test_duplicate_identifier_models_go_last_value_without_exporting_it(self):
+        out = summarize(500, b'{"data":{"fid":"a","FID":"b"}}')
+        self.assertEqual(
+            out["go_projection"]["identifiers"]["fid"], "nonempty"
+        )
+        self.assertNotIn('"a"', json.dumps(out))
+        self.assertNotIn('"b"', json.dumps(out))
+
     def test_nonobject_json(self):
-        for body in (b'null', b'[]', b'1', b'"DO_NOT_EXPORT_SECRET"'):
+        for body in (b"null", b"[]", b"1", b'"DO_NOT_EXPORT_SECRET"'):
             with self.subTest(body=body):
                 self.assertEqual(summarize(500, body)["json_state"], "not_object")
 
     def test_partial_error_ids_remain_unknown(self):
-        out = summarize(500, b'{"status":500,"code":50000,"data":{"task_id":"t"}}')
-        self.assertEqual(out["identifiers"],
-                         {"task_id": "nonempty", "fid": "missing", "upload_id": "missing"})
+        out = summarize(
+            500,
+            b'{"status":500,"code":50000,"data":{"task_id":"t"}}',
+        )
+        self.assertEqual(
+            out["go_projection"]["identifiers"],
+            {
+                "task_id": "nonempty",
+                "fid": "missing",
+                "upload_id": "missing",
+            },
+        )
         self.assertEqual(out["allocation_state"], "UNKNOWN")
 
     def test_http_status_not_coerced(self):
         for status in (None, True, "200", 0, 600):
             with self.subTest(status=status):
-                self.assertIsNone(summarize(status, b'{}')["http_status"])
+                self.assertIsNone(summarize(status, b"{}")["http_status"])
 
 
 if __name__ == "__main__":
