@@ -35,26 +35,41 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError("non-standard JSON constant: " + value)
 
 
+def _ascii_case_equal(candidate: str, key: str) -> bool:
+    """Conservative case-insensitive match for the audited ASCII JSON tags.
+
+    Go encoding/json uses Unicode simple folding for struct-field matching.
+    This research projection intentionally models only exact matches plus ASCII
+    case variants of the known lower-case tags. Non-ASCII folding remains an
+    explicit approximation boundary rather than being over-accepted by Python's
+    broader str.casefold().
+    """
+    return candidate == key or (
+        candidate.isascii() and key.isascii() and candidate.lower() == key.lower()
+    )
+
+
 def _go_field(obj: PairObject, key: str) -> Tuple[bool, Any]:
     """Approximate encoding/json struct-field matching for audited fields.
 
-    The baseline Go structs use lower-case JSON tags. For the evidence fields we
-    model exact/case-insensitive matching with later matching values replacing
-    earlier ones, which captures the duplicate/case-fold behavior relevant to
-    this research lab.
+    Later matching non-null values replace earlier values. For the non-pointer
+    scalar/struct fields projected here, a later JSON null is modeled as a
+    no-op when an earlier matching value already exists. Error propagation from
+    incompatible JSON types is deliberately outside this shape-only model.
     """
     found = False
     value: Any = None
-    folded = key.casefold()
     for candidate, candidate_value in obj:
-        if candidate == key or candidate.casefold() == folded:
+        if _ascii_case_equal(candidate, key):
+            if candidate_value is None and found:
+                continue
             found = True
             value = candidate_value
     return found, value
 
 
 def _raw_key_state(obj: PairObject, key: str) -> Dict[str, Any]:
-    matches = [candidate for candidate, _ in obj if candidate.casefold() == key.casefold()]
+    matches = [candidate for candidate, _ in obj if _ascii_case_equal(candidate, key)]
     return {
         "present": bool(matches),
         "matching_key_count": len(matches),
@@ -173,7 +188,7 @@ def valid_pre_observation() -> Observation:
         upload_id="synthetic-upload",
         obj_key="synthetic-object-key",
         bucket="synthetic-bucket",
-        upload_url="https://synthetic-upload.invalid",
+        upload_url="http://synthetic-upload.invalid",
         auth_info="synthetic-auth-info",
         part_size=1024,
     )
@@ -184,10 +199,22 @@ def _nonempty_string(value: Optional[str]) -> bool:
 
 
 def _usable_upload_url(value: Optional[str]) -> bool:
-    # The baseline later slices UploadUrl[7:]. Requiring an https:// prefix and
-    # a non-empty suffix prevents the known short/empty structural hazards in
-    # this model; it is not a provider URL contract.
-    return isinstance(value, str) and value.startswith("https://") and len(value) > 8
+    # The baseline later slices UploadUrl[7:] and prepends its own "https://".
+    # This model therefore accepts only values structurally compatible with a
+    # seven-byte "<4-char-scheme>://" prefix plus a non-empty host suffix.
+    # It intentionally does NOT claim which real provider scheme is guaranteed;
+    # E1/E2 must establish the observed scheme before a runtime validator exists.
+    if not isinstance(value, str) or len(value) <= 7:
+        return False
+    prefix, suffix = value[:7], value[7:]
+    return (
+        len(prefix) == 7
+        and prefix[4:] == "://"
+        and suffix != ""
+        and not suffix.startswith("/")
+        and "/" not in suffix
+        and not any(ch.isspace() for ch in suffix)
+    )
 
 
 def proposed_next_action(obs: Observation) -> str:
@@ -355,9 +382,23 @@ class AmbiguityTests(unittest.TestCase):
                     "STOP_ALLOCATION_UNKNOWN",
                 )
 
-    def test_upload_url_must_be_structurally_usable(self):
+    def test_upload_url_must_match_baseline_slice_shape(self):
         base = valid_pre_observation()
-        for value in (None, "", "https://", "http://host", "synthetic"):
+        self.assertEqual(
+            proposed_next_action(replace(base, upload_url="http://host")),
+            "CONTINUE_EXISTING_TASK_NOT_UPLOAD_SUCCESS",
+        )
+        for value in (
+            None,
+            "",
+            "http://",
+            "https://host",
+            "synthetic",
+            "ftp://host",
+            "http:///host",
+            "http://host/path",
+            "http://host name",
+        ):
             with self.subTest(value=value):
                 self.assertEqual(
                     proposed_next_action(replace(base, upload_url=value)),
@@ -530,6 +571,29 @@ class EvidenceProjectionTests(unittest.TestCase):
         self.assertEqual(
             out["go_projection"]["identifiers"]["fid"], "nonempty"
         )
+        self.assertNotIn('"a"', json.dumps(out))
+        self.assertNotIn('"b"', json.dumps(out))
+
+    def test_later_null_does_not_replace_prior_integer_in_go_projection(self):
+        out = summarize(500, b'{"code":31001,"code":null}')
+        self.assertEqual(
+            out["go_projection"]["code"],
+            {"state": "integer", "value": 31001},
+        )
+
+    def test_later_null_does_not_replace_prior_identifier_in_go_projection(self):
+        out = summarize(500, b'{"data":{"fid":"a","fid":null}}')
+        self.assertEqual(
+            out["go_projection"]["identifiers"]["fid"], "nonempty"
+        )
+        self.assertNotIn('"a"', json.dumps(out))
+
+    def test_unicode_full_casefold_lookalike_is_not_modeled_as_go_match(self):
+        out = summarize(500, '{"data":{"fid":"a","ﬁd":"b"}}'.encode("utf-8"))
+        self.assertEqual(
+            out["go_projection"]["identifiers"]["fid"], "nonempty"
+        )
+        self.assertEqual(out["raw_shape"]["data"]["matching_key_count"], 1)
         self.assertNotIn('"a"', json.dumps(out))
         self.assertNotIn('"b"', json.dumps(out))
 
