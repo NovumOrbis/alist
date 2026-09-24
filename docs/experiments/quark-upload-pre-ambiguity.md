@@ -123,10 +123,20 @@ The minimum structural PRE gate used by this research plan is therefore
 stricter than merely having task_id/fid. Before the existing upload pipeline is
 allowed to continue, a proposed validator must require an explicit HTTP 200,
 provider status 200/code 0, non-empty task_id, fid, upload_id, obj_key, bucket,
-a structurally usable upload_url, non-empty auth_info, and `part_size > 0`.
-This is a defensive baseline requirement derived from fields used by the
-current pipeline; it is not a provider protocol specification and still does
-**not** prove upload completion.
+non-empty auth_info, `part_size > 0`, and an upload_url structurally compatible
+with the baseline's literal `UploadUrl[7:]` slice. The baseline then prepends
+its own `https://<bucket>.` prefix [S4], so the research model requires a
+seven-byte `<4-char-scheme>://` prefix followed by a non-empty host suffix and
+rejects values that would leave a leading slash or path after the slice.
+
+This is a defensive baseline-derived shape check, **not** a provider protocol
+specification and not evidence that Quark guarantees a particular scheme. The
+real provider's observed upload_url scheme remains an E1/E2 evidence question.
+An over-strict validator is itself unsafe: if it rejects a legitimate PRE only
+after the provider allocated a task, a higher-level upload retry can allocate
+another orphan task. The validator therefore must not invent a stronger scheme
+contract than the baseline/evidence supports. A structurally valid PRE still
+does **not** prove upload completion.
 
 ### A4. Pre-call cancellation is not in-flight cancellation
 
@@ -206,9 +216,11 @@ These rules are proposed acceptance criteria, not installed driver behavior:
 | Documented non-allocation rejection or verified dedup protocol | Separately review a narrowly bounded recovery implementation |
 
 Minimum structural fields for the first row are: non-empty task_id, fid,
-upload_id, obj_key, bucket, auth_info; a structurally usable upload_url; and a
-positive integer part_size. Callback semantics and other provider fields may
-need further validation before a production validator is finalized.
+upload_id, obj_key, bucket, auth_info; a positive integer part_size; and an
+upload_url whose shape is compatible with the baseline's seven-byte
+`UploadUrl[7:]` slice. The model does not declare the real provider scheme to
+be a protocol guarantee. Callback semantics and other provider fields may need
+further validation before a production validator is finalized.
 
 A single attempted PRE can still leave one unknown allocation if its response
 is lost. No-replay limits additional allocations; it does **not** guarantee
@@ -229,9 +241,11 @@ It contains illustrative counterexamples with two histories that have identical
 client-visible failures but allocation counts zero and one; empty-listing
 ambiguity; extra allocation from blind replay; and a conservative PRE structure
 gate. The evidence projection keeps a raw-shape summary and a targeted
-Go-decoder projection separate, including case-insensitive/duplicate-key
-fixtures, missing/null fields, malformed UTF-8/JSON, bounded body inspection,
-ambiguous IDs, cancellation, and secret exclusion.
+Go-decoder projection separate, including duplicate keys and ASCII case
+variants, missing/null fields, malformed UTF-8/JSON, bounded body inspection,
+ambiguous IDs, cancellation, and secret exclusion. The projection deliberately
+does not claim exact Unicode simple-fold equivalence with Go's encoding/json;
+non-ASCII lookalike keys are kept outside the modeled match set.
 
 The model has no networking or credential discovery. All identifiers are
 synthetic. It is **not** an AList/Resty integration test, a provider probe, or
@@ -260,7 +274,11 @@ Required matrix:
 4. HTTP 500 with empty, incomplete, HTML, malformed JSON and identifier-bearing
    bodies; HTTP 200 with provider rejection; HTTP 201/204; missing/null fields;
    duplicate and case-variant JSON keys; zero/negative part_size; empty/short
-   upload_url. Assert fail-closed behavior before hash/part.
+   upload_url; baseline-compatible `http://host`; and an `https://host` shape
+   that the current `[7:]` slice would mis-handle. Assert fail-closed behavior
+   before hash/part without rejecting the baseline-compatible shape merely
+   because of an unproven provider-scheme assumption. Record the actually
+   observed provider scheme as evidence rather than protocol law.
 5. Cancel before request, while the server is blocked, and during retry backoff:
    prompt return, no hidden replay after cancellation; an earlier remote
    allocation remains UNKNOWN.
@@ -310,7 +328,9 @@ Public/exportable evidence uses an allowlist only:
   known envelope keys, without arbitrary key/value export;
 - a targeted Go-decoder projection for provider status/code and the
   presence/type/nonempty state of task_id/fid/upload_id, preserving
-  missing/null/invalid distinctions and duplicate/case-fold behavior;
+  missing/null/invalid distinctions and modeled duplicate/ASCII-case behavior;
+- the upload_url scheme category and whether the baseline `[7:]` host suffix
+  would be structurally usable, without exporting the host itself;
 - request count, redirect-hop count, stage, cancellation/transport-error
   category, elapsed time;
 - `ALLOCATION_STATE=UNKNOWN` unless independently established.
@@ -371,8 +391,10 @@ assume unknown tasks were cleaned. Record any residual allocation as unresolved.
    configuration.
 3. The first runtime hardening candidate, if supported by E1, is limited to
    observation/no-replay/fail-closed PRE mechanics. It must reject invalid PRE
-   before hash/part, avoid panic, and preserve overwrite rollback. This is not
-   automatic PRE recovery.
+   before hash/part, avoid panic, preserve overwrite rollback, and avoid an
+   over-strict upload_url scheme rule that would reject a baseline-compatible
+   allocated PRE. The provider scheme must be resolved from E1/E2 evidence, not
+   invented by the validator. This is not automatic PRE recovery.
 4. Resolve non-allocation/idempotency/resume semantics in the isolated evidence
    phase. Returned IDs alone are not permission to continue a failed task.
 5. Only then propose bounded recovery. Require exact attempt identity, upload
@@ -386,9 +408,11 @@ assume unknown tasks were cleaned. Record any residual allocation as unresolved.
 
 - Read-only source audit at the pinned baseline and Resty v2.14.0.
 - Initial offline Python lab: 23 top-level tests passed.
-- Corrective offline Python lab after adversarial review: **31 top-level tests
-  passed**, including stricter PRE structural fields, duplicate/case-fold JSON
-  shapes, int64 boundaries, malformed constants, and bounded evidence parsing.
+- Second corrective offline Python lab after targeted re-audit: **34 top-level
+  tests passed**, including baseline-compatible upload_url slicing, later-null
+  preservation for modeled Go scalar fields, a non-ASCII full-casefold
+  counterexample, stricter PRE structural fields, int64 boundaries, malformed
+  constants, and bounded evidence parsing.
 - `python3 -m py_compile docs/experiments/quark_upload_pre_lab.py`: passed for
   the corrective lab.
 - Documentation and lab only; production Go tree unchanged.
