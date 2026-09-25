@@ -141,18 +141,19 @@ func TestE1HardeningPutStopsBeforeHashOnInvalidPre(t *testing.T) {
 		mu.Unlock()
 		if r.URL.Path != "/1/clouddrive/file/upload/pre" {
 			t.Errorf("unexpected request after invalid PRE: %s", r.URL.Path)
+			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = io.WriteString(w, `{}`)
+		pre := e1ValidPreResponse()
+		pre.Metadata.PartSize = 0
+		writeJSON(w, http.StatusOK, pre)
 	}))
 	defer srv.Close()
 
 	d := newTestDriver(srv.URL)
 	dst := &model.Object{ID: "parent", Name: "parent", IsFolder: true}
 	err := d.Put(context.Background(), dst, e1UploadStream(), func(float64) {})
-	if err == nil || !strings.Contains(err.Error(), "stage pre") {
-		t.Fatalf("err=%v, want PRE failure", err)
+	if err == nil || !strings.Contains(err.Error(), "stage pre") || !strings.Contains(err.Error(), "part_size") {
+		t.Fatalf("err=%v, want structural PRE failure before hash", err)
 	}
 
 	mu.Lock()
@@ -207,6 +208,7 @@ func TestE1HardeningPreCallerCancellationCancelsInFlightRequest(t *testing.T) {
 	d := newTestDriver("http://loopback.invalid")
 	d.client = client
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() {
 		_, err := d.upPreReliable(ctx, e1UploadStream(), "parent")
@@ -581,7 +583,10 @@ func TestE1HardeningPreDoesNotMutateSelectedRestyClient(t *testing.T) {
 	}
 	d := newTestDriver(origin.URL)
 	d.client = client
-	_, _ = d.upPreReliable(context.Background(), e1UploadStream(), "parent")
+	_, err := d.upPreReliable(context.Background(), e1UploadStream(), "parent")
+	if err == nil || !strings.Contains(err.Error(), "HTTP status 307") {
+		t.Fatalf("err=%v, want redirect rejection", err)
+	}
 
 	if client.RetryCount != 3 {
 		t.Fatalf("RetryCount=%d, want source client unchanged at 3", client.RetryCount)
