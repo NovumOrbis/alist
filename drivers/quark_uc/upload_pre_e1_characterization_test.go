@@ -576,7 +576,9 @@ func TestE1HardeningPreDoesNotMutateSelectedRestyClient(t *testing.T) {
 	defer origin.Close()
 
 	client := base.NewRestyClient()
-	originalRedirect := client.GetClient().CheckRedirect
+	if client.GetClient().CheckRedirect != nil {
+		t.Fatal("test requires the source client to start with the default redirect policy")
+	}
 	d := newTestDriver(origin.URL)
 	d.client = client
 	_, _ = d.upPreReliable(context.Background(), e1UploadStream(), "parent")
@@ -584,7 +586,7 @@ func TestE1HardeningPreDoesNotMutateSelectedRestyClient(t *testing.T) {
 	if client.RetryCount != 3 {
 		t.Fatalf("RetryCount=%d, want source client unchanged at 3", client.RetryCount)
 	}
-	if client.GetClient().CheckRedirect != originalRedirect {
+	if client.GetClient().CheckRedirect != nil {
 		t.Fatal("source http.Client CheckRedirect was mutated")
 	}
 	if redirected != 0 {
