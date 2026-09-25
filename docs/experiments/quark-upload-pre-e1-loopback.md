@@ -1,101 +1,114 @@
-# Quark upload/pre E1 loopback characterization
+# Quark upload/pre E1 hardening candidate
 
-Status: **DRAFT E1 / LOOPBACK-ONLY / NO PROVIDER MUTATION**.
+Status: **DRAFT HARDENING / LOOPBACK-ONLY VALIDATION / NO AUTOMATIC PRE RECOVERY**.
 
-Baseline:
+Frozen characterization prerequisite:
 
-`AlistGo/alist@fb0731a6953012e7b72b89bf5473817caa4625f9`
+- baseline: `AlistGo/alist@fb0731a6953012e7b72b89bf5473817caa4625f9`
+- accepted characterization: `NovumOrbis/alist#9@5aa8b80bc5ad0a07775780f9c8a21fa2e6eb5274`
+- research prerequisite: `NovumOrbis/alist#8@70c495d75c176edb813faabadeba849615cfe437`
 
-Research prerequisite:
+The accepted characterization proved that the baseline could:
 
-`NovumOrbis/alist#8@70c495d75c176edb813faabadeba849615cfe437`
+- return nil error for HTTP 500 + empty/HTML PRE responses;
+- accept an HTTP 200 provider rejection;
+- reach an integer divide-by-zero after a zero-valued PRE;
+- replay PRE through Resty's configured transport retry budget;
+- leave PRE detached from the caller context;
+- follow 307 and 302 redirects, causing POST replay or method conversion.
 
-This branch starts the E1 phase from the accepted research baseline. It adds
-actual-driver loopback characterization tests only. It does not yet change
-production Go behavior and does not implement automatic PRE recovery.
+This branch turns those observations into fail-closed runtime behavior and
+post-fix regression expectations.
 
-## Safety boundary
+## Runtime scope
 
-The tests may use:
+The hardening is intentionally limited to `/file/upload/pre`.
 
-- `httptest`
-- synthetic Resty/`net/http` transports
-- loopback-only HTTP servers
-- synthetic file metadata and provider envelopes
+It:
 
-The tests must not:
+1. executes PRE through a dedicated Resty wrapper with **RetryCount=0**;
+2. reuses the selected client's underlying transport, cookie jar and timeout;
+3. disables HTTP redirects for PRE with `http.ErrUseLastResponse`;
+4. binds PRE to the caller context;
+5. requires exact HTTP 200;
+6. rejects provider status/code failures;
+7. requires non-empty `task_id`, `fid`, `upload_id`, `obj_key`,
+   `bucket` and `auth_info`;
+8. requires positive `part_size`;
+9. validates that `upload_url` is compatible with the existing
+   `UploadUrl[7:]` target construction without asserting a real-provider
+   scheme contract;
+10. returns before hash/part if PRE is invalid;
+11. preserves response-session cookie merging;
+12. does not mutate the shared Resty client's retry or redirect settings.
 
-- call real Quark or UC endpoints
-- use cookies, tokens or production credentials
-- access the NAS
-- create provider upload tasks
-- modify `.hbk` backup data
-- add automatic `/file/upload/pre` retry
-- enable `same_path_reuse`
+The general `requestWithCookie` path keeps its existing retry behavior.
+Hash/part/commit/finish reliability behavior is unchanged.
 
-## Initial characterization matrix
+## Explicit non-goals
 
-The first E1 commit exercises these exact baseline paths:
+This candidate does **not**:
 
-1. HTTP 500 + JSON `{}` can be returned as nil error with zero-valued PRE.
-2. HTTP 500 + HTML can be returned as nil error with zero-valued PRE.
-3. HTTP 200 + provider rejection can be decoded into `UpPreResp` while the
-   separate error envelope remains zero, so the request helper can return nil.
-4. A zero PRE followed by an equally misclassified hash response can reach the
-   exact `runtime.Error` integer divide-by-zero panic in `Put`. The test owns
-   a temporary directory explicitly and requires the loopback server to observe
-   PRE followed by hash before accepting that panic.
-5. The production `base.NewRestyClient()` retry settings, with only its
-   transport replaced by a synthetic no-network RoundTripper, can issue four
-   wire PRE attempts for a transport error even though `upPreReliable` has no
-   explicit retry loop.
-6. Caller cancellation after PRE starts does not propagate into the current
-   PRE request context. The synthetic transport inspects `req.Context()` after
-   cancellation and is context-aware, so this characterization is expected to
-   fail once PRE correctly attaches the caller context.
-7. HTTP 307 preserves and replays the PRE POST and body.
-8. HTTP 302 converts the POST redirect follow-up into GET.
-9. Explicit provider errors are staged as PRE failures under Quark and UC PRE
-   configuration values. The loopback cases use the provider-specific `pr`
-   and Referer values while replacing only the API origin with the test server.
-10. Cancellation before PRE starts emits no request.
+- retry an ambiguous PRE;
+- infer that no provider allocation occurred;
+- resume an unknown task;
+- enable `same_path_reuse`;
+- discover or delete orphan tasks;
+- add provider cleanup;
+- change shared Resty retry semantics;
+- change overwrite behavior in `internal/op`;
+- authorize a real-provider experiment or NAS mutation.
 
-These are **baseline characterization assertions**. They intentionally describe
-unsafe or ambiguous behavior that the next hardening candidate must reverse.
-They are not intended as permanent regression expectations for a fixed runtime.
+A failed PRE remains allocation-ambiguous. Fail-closed behavior prevents the
+same driver call from making an additional PRE; it cannot prove that the first
+request did not allocate remotely.
 
-## Corrective review status
+## Regression matrix
 
-An independent read-only review of the preceding head
-`d1d80e4061075785737b29242bdde50b8c4599a4` found two blocking test defects:
+The post-fix test matrix covers:
 
-- the panic characterization could fail before HTTP because the package's
-  relative temp directory did not exist, and it accepted any panic rather than
-  the documented divide-by-zero;
-- the in-flight cancellation transport ignored `req.Context()`, so the test
-  would still pass after the intended context-propagation fix.
+- HTTP 500 + `{}` -> staged error, one PRE;
+- HTTP 500 + HTML -> staged error, one PRE;
+- HTTP 200 provider rejection -> staged provider error;
+- invalid PRE -> `Put` returns before hash and cannot reach the prior
+  divide-by-zero path;
+- transport failure -> exactly one wire PRE even when the selected source client
+  is `base.NewRestyClient()` with its normal RetryCount=3;
+- caller cancellation -> in-flight PRE observes `context.Canceled`;
+- 307 -> rejected without replay;
+- 302 -> rejected without POST-to-GET follow-up;
+- cross-origin redirect -> target server receives zero requests;
+- provider-specific Quark/UC `pr` and Referer values remain staged correctly;
+- cancellation before PRE -> zero requests;
+- exact HTTP 200 requirement, including 201/204 rejection;
+- required PRE structural fields and positive part size;
+- baseline-compatible and incompatible upload URL shapes, including the prior
+  N3 query/fragment/IPv6/control-character cases;
+- partial response-body read failure -> error with one attempt;
+- PRE response `__puus` merge preservation;
+- source Resty retry/redirect configuration remains unmodified.
 
-The current corrective changes make both tests independently diagnostic. They
-also bind the 1+3 retry test to `base.NewRestyClient()` and exercise the
-provider-specific Quark/UC PRE `pr` and Referer values on loopback.
+The accepted characterization's E1-05 timeout hygiene is also incorporated in
+the post-fix cancellation test through bounded channel waits.
 
-This document does **not** claim the corrected exact head has passed the
-targeted/repeat/race/shuffle/vet gate yet. That is the next independent gate.
+## Validation gate
 
-## Next E1 step
+Before this candidate is eligible for a clean submission branch, run on its
+exact SHA:
 
-After this characterization compiles and runs on the exact baseline:
+```sh
+go test ./drivers/quark_uc -run '^TestE1' -count=1 -v
+go test ./drivers/quark_uc -run '^TestE1' -count=10
+go test -race ./drivers/quark_uc -run '^TestE1' -count=1
+go test -shuffle=on ./drivers/quark_uc -run '^TestE1' -count=1
+go test ./drivers/quark_uc
+go test -race -shuffle=on ./drivers/quark_uc
+go vet ./drivers/quark_uc
+git diff --check
+```
 
-- convert the unsafe observations into fail-closed regression expectations;
-- introduce a narrow PRE-only no-replay request path without mutating the shared
-  Resty client;
-- attach the caller context in flight;
-- expose and validate actual HTTP + provider envelope state;
-- reject structurally unusable PRE before hash/part and before any panic path;
-- preserve existing provider error attribution and cookie-refresh behavior;
-- add redirect, timeout, partial-body, URL-shape and overwrite rollback cases;
-- run the matrix for Quark and UC;
-- run package vet/test/race/shuffle plus internal/op and server/webdav gates.
+Then run the relevant `internal/op` and `server/webdav` gates before an
+upstream submission candidate is declared ready.
 
-This E1 phase remains **observation/no-replay/fail-closed only**. It does not
-authorize automatic recovery of an ambiguous PRE allocation.
+This document intentionally makes no claim that those gates have passed on the
+current hardening head until they are independently executed.
