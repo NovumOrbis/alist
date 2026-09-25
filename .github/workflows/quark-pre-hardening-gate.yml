@@ -1,0 +1,36 @@
+name: quark-pre-hardening-gate
+
+on:
+  push:
+    branches:
+      - ci/quark-pre-hardening-gate-20260925
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Targeted E1 tests
+        run: go test ./drivers/quark_uc -run '^TestE1' -count=1 -v
+      - name: Repeat E1 tests
+        run: go test ./drivers/quark_uc -run '^TestE1' -count=10
+      - name: Race E1 tests
+        run: go test -race ./drivers/quark_uc -run '^TestE1' -count=1
+      - name: Shuffle E1 tests
+        run: go test -shuffle=on ./drivers/quark_uc -run '^TestE1' -count=1
+      - name: Full quark package
+        run: go test ./drivers/quark_uc
+      - name: Full quark race shuffle
+        run: go test -race -shuffle=on ./drivers/quark_uc
+      - name: Vet quark package
+        run: go vet ./drivers/quark_uc
+      - name: Related op and webdav packages
+        run: go test ./internal/op ./server/webdav
