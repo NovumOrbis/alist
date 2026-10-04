@@ -432,10 +432,7 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 	}
 	srcObj := model.UnwrapObj(srcRawObj)
 	srcDirPath := stdpath.Dir(srcPath)
-	srcDir, srcDirErr := GetUnwrap(ctx, storage, srcDirPath)
-	if srcDirErr != nil {
-		return errors.WithMessage(srcDirErr, "failed to get src dir")
-	}
+	srcDir, _ := GetUnwrap(ctx, storage, srcDirPath)
 	dstDir, err := GetUnwrap(ctx, storage, dstDirPath)
 	if err != nil {
 		return errors.WithMessage(err, "failed to get dst dir")
@@ -481,10 +478,7 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string,
 	}
 	srcObj := model.UnwrapObj(srcRawObj)
 	srcDirPath := stdpath.Dir(srcPath)
-	srcDir, srcDirErr := GetUnwrap(ctx, storage, srcDirPath)
-	if srcDirErr != nil {
-		return errors.WithMessage(srcDirErr, "failed to get src dir")
-	}
+	srcDir, _ := GetUnwrap(ctx, storage, srcDirPath)
 
 	switch s := storage.(type) {
 	case driver.RenameResult:
@@ -570,10 +564,7 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		return errors.WithMessage(err, "failed to get object")
 	}
 	dirPath := stdpath.Dir(path)
-	parentDir, parentErr := GetUnwrap(ctx, storage, dirPath)
-	if parentErr != nil {
-		return errors.WithMessage(parentErr, "failed to get parent dir")
-	}
+	parentDir, _ := GetUnwrap(ctx, storage, dirPath)
 
 	switch s := storage.(type) {
 	case driver.Remove:
