@@ -119,16 +119,15 @@ func TestPutResultBridgesStaleListingForImmediateRemove(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/1/clouddrive/file/sort":
 			listCalls++
-			// Model the production failure: the backend listing remains stale and
-			// never exposes the just-uploaded lock during this request sequence.
+			// Model the production failure with the strongest edge case: the
+			// backend listing remains empty/stale, so there is no parent list cache
+			// entry for addCacheObj to update after the upload.
 			writeJSON(w, http.StatusOK, map[string]any{
 				"status": 200,
 				"code":   0,
-				"data": map[string]any{"list": []map[string]any{{
-					"fid": "fid-old-lock", "file_name": "old-lock", "file": true, "size": 1,
-				}}},
+				"data":   map[string]any{"list": []any{}},
 				"metadata": map[string]any{
-					"_size": 100, "_page": 1, "_count": 1, "_total": 1,
+					"_size": 100, "_page": 1, "_count": 0, "_total": 0,
 				},
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/1/clouddrive/file/upload/pre":
