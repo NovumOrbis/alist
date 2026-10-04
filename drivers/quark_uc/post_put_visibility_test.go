@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/alist-org/alist/v3/internal/driver"
+	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	streamPkg "github.com/alist-org/alist/v3/internal/stream"
@@ -190,10 +191,19 @@ func TestPutResultBridgesStaleListingForImmediateRemove(t *testing.T) {
 		t.Fatalf("op.Remove after successful PutResult: %v", err)
 	}
 
-	if listCalls != 1 {
-		t.Fatalf("listCalls=%d, want 1; follow-up remove should use the post-put cached fid", listCalls)
+	if listCalls != 2 {
+		t.Fatalf("listCalls=%d, want 2; delete should survive a second stale backend lookup", listCalls)
 	}
 	if preCalls != 1 || hashCalls != 1 || deleteCalls != 1 {
 		t.Fatalf("pre/hash/delete calls=%d/%d/%d, want 1/1/1", preCalls, hashCalls, deleteCalls)
+	}
+
+	// Successful removal must invalidate the short consistency bridge. With the
+	// backend still modeled as empty/stale, the removed path must not reappear.
+	if _, err := op.Get(ctx, d, "/"+name); !errs.IsObjectNotFound(err) {
+		t.Fatalf("op.Get after remove error=%v, want object not found", err)
+	}
+	if listCalls != 3 {
+		t.Fatalf("listCalls=%d after removal verification, want 3", listCalls)
 	}
 }
