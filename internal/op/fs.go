@@ -37,8 +37,9 @@ func recentWriteIdentityKey(storage *model.Storage, parentID, name string) (stri
 	if storage == nil || parentID == "" || name == "" {
 		return "", false
 	}
-	// MountPath is unique for mounted storages. NUL cannot occur in provider
-	// object names or IDs, so it is a safe unambiguous separator here.
+	// Storage ID plus MountPath isolates both concurrent mounts and a newly
+	// created storage that reuses a recently removed mount path. NUL cannot
+	// occur in provider object names or IDs, so it is an unambiguous separator.
 	return strconv.FormatUint(uint64(storage.ID), 10) + "\x00" + storage.MountPath + "\x00" + parentID + "\x00" + name, true
 }
 
