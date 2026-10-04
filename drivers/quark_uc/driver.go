@@ -284,6 +284,11 @@ func (d *QuarkOrUC) Remove(ctx context.Context, obj model.Obj) error {
 	return err
 }
 
+// uploadedFileFromPre returns the exact FID allocated by upload/pre so op.Put
+// can seed the parent cache after a successful upload. Quark directory listings
+// can lag behind a completed upload; keeping this identity bridges that window
+// for immediate follow-up operations such as WebDAV DELETE. If PRE did not
+// provide a FID, preserve the old cache-clear behavior instead of inventing one.
 func uploadedFileFromPre(pre UpPreResp, stream model.FileStreamer) model.Obj {
 	if pre.Data.Fid == "" {
 		return nil
