@@ -8,7 +8,7 @@ import (
 )
 
 func TestRecentWriteIdentityKeyBindsToParentID(t *testing.T) {
-	storage := &model.Storage{MountPath: "/quark"}
+	storage := &model.Storage{ID: 1, MountPath: "/quark"}
 	const name = "x"
 
 	original, ok := recentWriteIdentityKey(storage, "parent-old", name)
@@ -31,17 +31,25 @@ func TestRecentWriteIdentityKeyBindsToParentID(t *testing.T) {
 		t.Fatal("different parent IDs must never share a recent-write key")
 	}
 
-	otherStorage, ok := recentWriteIdentityKey(&model.Storage{MountPath: "/other"}, "parent-old", name)
+	otherStorage, ok := recentWriteIdentityKey(&model.Storage{ID: 2, MountPath: "/other"}, "parent-old", name)
 	if !ok {
 		t.Fatal("other storage identity rejected")
 	}
 	if original == otherStorage {
-		t.Fatal("different storage mount paths must never share a recent-write key")
+		t.Fatal("different storage identities must never share a recent-write key")
+	}
+
+	reusedMount, ok := recentWriteIdentityKey(&model.Storage{ID: 2, MountPath: "/quark"}, "parent-old", name)
+	if !ok {
+		t.Fatal("reused mount identity rejected")
+	}
+	if original == reusedMount {
+		t.Fatal("a newly-created storage reusing the same mount path must not inherit recent-write entries")
 	}
 }
 
 func TestRecentWriteCacheDoesNotRebindChildToRecreatedParent(t *testing.T) {
-	storage := &model.Storage{MountPath: "/quark"}
+	storage := &model.Storage{ID: 1, MountPath: "/quark"}
 	oldKey, ok := recentWriteIdentityKey(storage, "parent-old", "x")
 	if !ok {
 		t.Fatal("old key rejected")
@@ -74,7 +82,7 @@ func TestRecentWriteIdentityKeyRejectsMissingStableIdentity(t *testing.T) {
 		objName  string
 	}{
 		{name: "nil storage", storage: nil, parentID: "parent", objName: "x"},
-		{name: "missing parent id", storage: &model.Storage{MountPath: "/quark"}, objName: "x"},
+		{name: "missing parent id", storage: &model.Storage{ID: 1, MountPath: "/quark"}, objName: "x"},
 		{name: "missing name", storage: &model.Storage{MountPath: "/quark"}, parentID: "parent"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
