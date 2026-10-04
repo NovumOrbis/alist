@@ -396,8 +396,11 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		newObj, err = s.Move(ctx, srcObj, dstDir)
 		if err == nil {
 			delCacheObj(storage, srcDirPath, srcRawObj)
+			recentWriteCache.Del(Key(storage, srcPath))
 			if newObj != nil {
-				addCacheObj(storage, dstDirPath, model.WrapObjName(newObj))
+				wrapped := model.WrapObjName(newObj)
+				addCacheObj(storage, dstDirPath, wrapped)
+				recentWriteCache.Set(Key(storage, stdpath.Join(dstDirPath, wrapped.GetName())), wrapped, cache.WithEx[model.Obj](recentWriteConsistencyWindow))
 			} else if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, dstDirPath)
 			}
@@ -406,6 +409,7 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		err = s.Move(ctx, srcObj, dstDir)
 		if err == nil {
 			delCacheObj(storage, srcDirPath, srcRawObj)
+			recentWriteCache.Del(Key(storage, srcPath))
 			if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, dstDirPath)
 			}
@@ -433,16 +437,22 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string,
 		var newObj model.Obj
 		newObj, err = s.Rename(ctx, srcObj, dstName)
 		if err == nil {
+			recentWriteCache.Del(Key(storage, srcPath))
 			if newObj != nil {
-				updateCacheObj(storage, srcDirPath, srcRawObj, model.WrapObjName(newObj))
+				wrapped := model.WrapObjName(newObj)
+				updateCacheObj(storage, srcDirPath, srcRawObj, wrapped)
+				recentWriteCache.Set(Key(storage, stdpath.Join(srcDirPath, wrapped.GetName())), wrapped, cache.WithEx[model.Obj](recentWriteConsistencyWindow))
 			} else if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, srcDirPath)
 			}
 		}
 	case driver.Rename:
 		err = s.Rename(ctx, srcObj, dstName)
-		if err == nil && !utils.IsBool(lazyCache...) {
-			ClearCache(storage, srcDirPath)
+		if err == nil {
+			recentWriteCache.Del(Key(storage, srcPath))
+			if !utils.IsBool(lazyCache...) {
+				ClearCache(storage, srcDirPath)
+			}
 		}
 	default:
 		return errs.NotImplement
