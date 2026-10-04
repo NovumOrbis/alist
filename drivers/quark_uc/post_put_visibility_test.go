@@ -13,9 +13,21 @@ import (
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	streamPkg "github.com/alist-org/alist/v3/internal/stream"
+	"github.com/alist-org/alist/v3/pkg/utils"
 )
 
 var _ driver.PutResult = (*QuarkOrUC)(nil)
+
+func uploadVisibilityTestObj(name string, payload []byte) *model.Object {
+	return &model.Object{
+		Name: name,
+		Size: int64(len(payload)),
+		HashInfo: utils.NewHashInfoByMap(map[*utils.HashType]string{
+			utils.MD5:  utils.HashData(utils.MD5, payload),
+			utils.SHA1: utils.HashData(utils.SHA1, payload),
+		}),
+	}
+}
 
 func TestPutReturnsPreallocatedFIDForImmediateFollowupOperations(t *testing.T) {
 	const (
@@ -60,10 +72,7 @@ func TestPutReturnsPreallocatedFIDForImmediateFollowupOperations(t *testing.T) {
 	d := newTestDriver(srv.URL)
 	parent := &model.Object{ID: parentID, Name: "parent", IsFolder: true}
 	fs := &streamPkg.FileStream{
-		Obj: &model.Object{
-			Name: name,
-			Size: int64(len(payload)),
-		},
+		Obj:      uploadVisibilityTestObj(name, payload),
 		Reader:   bytes.NewReader(payload),
 		Mimetype: "application/octet-stream",
 	}
@@ -95,14 +104,13 @@ func TestPutReturnsPreallocatedFIDForImmediateFollowupOperations(t *testing.T) {
 
 func TestUploadedFileFromPreDoesNotInventMissingFID(t *testing.T) {
 	fs := &streamPkg.FileStream{
-		Obj: &model.Object{Name: "lock", Size: 1},
+		Obj:    &model.Object{Name: "lock", Size: 1},
 		Reader: bytes.NewReader([]byte{1}),
 	}
 	if obj := uploadedFileFromPre(UpPreResp{}, fs); obj != nil {
 		t.Fatalf("uploadedFileFromPre without fid = %#v, want nil", obj)
 	}
 }
-
 
 func TestPutResultBridgesStaleListingForImmediateRemove(t *testing.T) {
 	const (
@@ -175,10 +183,7 @@ func TestPutResultBridgesStaleListingForImmediateRemove(t *testing.T) {
 	d := newTestDriver(srv.URL)
 	d.RootFolderID = parentID
 	fs := &streamPkg.FileStream{
-		Obj: &model.Object{
-			Name: name,
-			Size: int64(len(payload)),
-		},
+		Obj:      uploadVisibilityTestObj(name, payload),
 		Reader:   bytes.NewReader(payload),
 		Mimetype: "application/octet-stream",
 	}
