@@ -4,6 +4,7 @@ import (
 	"context"
 	stdpath "path"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/Xhofe/go-cache"
@@ -38,7 +39,7 @@ func recentWriteIdentityKey(storage *model.Storage, parentID, name string) (stri
 	}
 	// MountPath is unique for mounted storages. NUL cannot occur in provider
 	// object names or IDs, so it is a safe unambiguous separator here.
-	return storage.MountPath + "\x00" + parentID + "\x00" + name, true
+	return strconv.FormatUint(uint64(storage.ID), 10) + "\x00" + storage.MountPath + "\x00" + parentID + "\x00" + name, true
 }
 
 func recentWriteKey(storage driver.Driver, parent model.Obj, name string) (string, bool) {
