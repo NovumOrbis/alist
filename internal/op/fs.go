@@ -23,6 +23,14 @@ import (
 var listCache = cache.NewMemCache(cache.WithShards[[]model.Obj](64))
 var listG singleflight.Group[[]model.Obj]
 
+const recentWriteConsistencyWindow = time.Minute
+
+// recentWriteCache bridges a short write-after-read consistency window for
+// drivers that return an authoritative object from PutResult. It is consulted
+// only after the normal backend/list lookup misses, so a fresh provider result
+// always wins.
+var recentWriteCache = cache.NewMemCache(cache.WithShards[model.Obj](64))
+
 func updateCacheObj(storage driver.Driver, path string, oldObj model.Obj, newObj model.Obj) {
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
@@ -232,6 +240,10 @@ func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, er
 		if f.GetName() == name {
 			return f, nil
 		}
+	}
+	if obj, ok := recentWriteCache.Get(Key(storage, path)); ok {
+		log.Debugf("use recent write when get %s", path)
+		return obj, nil
 	}
 	log.Debugf("cant find obj with name: %s", name)
 	return nil, errors.WithStack(errs.ObjectNotFound)
@@ -500,6 +512,7 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		err = s.Remove(ctx, model.UnwrapObj(rawObj))
 		if err == nil {
 			delCacheObj(storage, dirPath, rawObj)
+			recentWriteCache.Del(Key(storage, path))
 			// clear folder cache recursively
 			if rawObj.IsDir() {
 				ClearCache(storage, path)
@@ -568,7 +581,9 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		newObj, err = s.Put(ctx, parentDir, file, up)
 		if err == nil {
 			if newObj != nil {
-				addCacheObj(storage, dstDirPath, model.WrapObjName(newObj))
+				wrapped := model.WrapObjName(newObj)
+				addCacheObj(storage, dstDirPath, wrapped)
+				recentWriteCache.Set(Key(storage, dstPath), wrapped, cache.WithEx[model.Obj](recentWriteConsistencyWindow))
 			} else if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, dstDirPath)
 			}
