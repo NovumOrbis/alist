@@ -3,12 +3,14 @@ package quark
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
 	streamPkg "github.com/alist-org/alist/v3/internal/stream"
 )
 
@@ -97,5 +99,102 @@ func TestUploadedFileFromPreDoesNotInventMissingFID(t *testing.T) {
 	}
 	if obj := uploadedFileFromPre(UpPreResp{}, fs); obj != nil {
 		t.Fatalf("uploadedFileFromPre without fid = %#v, want nil", obj)
+	}
+}
+
+
+func TestPutResultBridgesStaleListingForImmediateRemove(t *testing.T) {
+	const (
+		parentID = "parent-lock"
+		fid      = "fid-new-lock"
+		name     = "lock_keep_alive.@writer_version_0.regression"
+	)
+	payload := []byte("lock")
+
+	listCalls := 0
+	preCalls := 0
+	hashCalls := 0
+	deleteCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/1/clouddrive/file/sort":
+			listCalls++
+			// Model the production failure: the backend listing remains stale and
+			// never exposes the just-uploaded lock during this request sequence.
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": 200,
+				"code":   0,
+				"data": map[string]any{"list": []map[string]any{{
+					"fid": "fid-old-lock", "file_name": "old-lock", "file": true, "size": 1,
+				}}},
+				"metadata": map[string]any{
+					"_size": 100, "_page": 1, "_count": 1, "_total": 1,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/1/clouddrive/file/upload/pre":
+			preCalls++
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": 200,
+				"code":   0,
+				"data": map[string]any{
+					"task_id":    "task-lock",
+					"fid":        fid,
+					"upload_id":  "upload-lock",
+					"obj_key":    "object-lock",
+					"upload_url": "https://oss.test",
+					"bucket":     "bucket",
+					"auth_info":  "auth",
+				},
+				"metadata": map[string]any{
+					"part_size": 4 * 1024 * 1024,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/1/clouddrive/file/update/hash":
+			hashCalls++
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": 200,
+				"code":   0,
+				"data":   map[string]any{"finish": true},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/1/clouddrive/file/delete":
+			deleteCalls++
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read delete body: %v", err)
+			}
+			if !bytes.Contains(body, []byte(fid)) {
+				t.Fatalf("delete body %q does not contain uploaded fid %q", body, fid)
+			}
+			writeJSON(w, http.StatusOK, Resp{Status: 200, Code: 0, Message: "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	d := newTestDriver(srv.URL)
+	d.RootFolderID = parentID
+	fs := &streamPkg.FileStream{
+		Obj: &model.Object{
+			Name: name,
+			Size: int64(len(payload)),
+		},
+		Reader:   bytes.NewReader(payload),
+		Mimetype: "application/octet-stream",
+	}
+
+	ctx := context.Background()
+	if err := op.Put(ctx, d, "/", fs, nil); err != nil {
+		t.Fatalf("op.Put: %v", err)
+	}
+	if err := op.Remove(ctx, d, "/"+name); err != nil {
+		t.Fatalf("op.Remove after successful PutResult: %v", err)
+	}
+
+	if listCalls != 1 {
+		t.Fatalf("listCalls=%d, want 1; follow-up remove should use the post-put cached fid", listCalls)
+	}
+	if preCalls != 1 || hashCalls != 1 || deleteCalls != 1 {
+		t.Fatalf("pre/hash/delete calls=%d/%d/%d, want 1/1/1", preCalls, hashCalls, deleteCalls)
 	}
 }
